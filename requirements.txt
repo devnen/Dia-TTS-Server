@@ -26,3 +26,5 @@ tqdm
 # Audio Post-processing
 pydub
 praat-parselmouth # For unvoiced segment removal
+PyYAML # For parsing presets.yaml
+hf-transfer

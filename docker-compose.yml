@@ -1,25 +1,37 @@
-version: '3.8'
+volumes:
+  model_cache:
 
 services:
   dia-tts-server:
+    # image: nextboss/dia-tts-server
     build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "${PORT:-8003}:${PORT:-8003}"
     volumes:
-      - ./model_cache:/app/model_cache
+      - model_cache:/app/model_cache
       - ./reference_audio:/app/reference_audio
       - ./outputs:/app/outputs
       - ./voices:/app/voices
       - ./config.yaml:/app/config.yaml
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+
+    devices:
+      - nvidia.com/gpu=all
+    device_cgroup_rules:
+      - "c 195:* rmw"
+      - "c 236:* rmw"
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
     restart: unless-stopped
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HUB_ENABLE_HF_TRANSFER=1
     env_file:
       - .env

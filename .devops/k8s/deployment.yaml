@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dia-tts-server
+  labels:
+    app: dia-tts-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dia-tts-server
+  template:
+    metadata:
+      labels:
+        app: dia-tts-server
+    spec:
+      containers:
+      - name: dia-tts-server
+        image: nextboss/dia-tts-server
+        ports:
+        - containerPort: 8003
+          name: http
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "1"
+        envFrom:
+        - configMapRef:
+            name: dia-tts-config
+        volumeMounts:
+        - name: model-cache
+          mountPath: /app/model_cache
+        - name: reference-audio
+          mountPath: /app/reference_audio
+        - name: outputs
+          mountPath: /app/outputs
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-cache-pvc
+      - name: reference-audio
+        persistentVolumeClaim:
+          claimName: reference-audio-pvc
+      - name: outputs
+        persistentVolumeClaim:
+          claimName: outputs-pvc
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dia-tts-server
+spec:
+  selector:
+    app: dia-tts-server
+  ports:
+  - port: 8003
+    targetPort: 8003
+    name: http
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: reference-audio-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: outputs-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dia-tts-config
+data:
+  PORT: "8003"
+  # Add other environment variables from .env file here
