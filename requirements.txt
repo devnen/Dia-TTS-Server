@@ -20,3 +20,4 @@ Jinja2
 python-multipart # For potential file uploads in UI
 requests # For health checks or other potential uses
 PyYAML # For parsing presets.yaml
+hf-transfer
