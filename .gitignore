@@ -9,3 +9,4 @@ __pycache__/
 # Ignore development tools
 .vscode/
 .venv
+.env
