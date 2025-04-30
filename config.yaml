@@ -4,8 +4,12 @@ server:
 model:
   repo_id: ttj/dia-1.6b-safetensors
   config_filename: config.json
-  weights_filename: dia-v0_1.safetensors
-  whisper_model_name: small.en
+  weights_filename: dia-v0_1_bf16.safetensors # dia-v0_1.safetensors
+  # Available Whisper model sizes: tiny, base, small, medium, large
+  # Language options: use without suffix for multilingual, or add language code
+  # suffix like .en (English), .fr (French), .de (German), .es (Spanish), etc.
+  # Examples: tiny, tiny.en, base, base.fr, small, medium.de, large
+  whisper_model_name: tiny
 paths:
   model_cache: ./model_cache
   reference_audio: ./reference_audio
@@ -13,7 +17,7 @@ paths:
   voices: ./voices
 generation_defaults:
   speed_factor: 0.9
-  cfg_scale: 3.0
+  cfg_scale: 3
   temperature: 1.3
   top_p: 0.95
   cfg_filter_top_k: 35
@@ -21,16 +25,10 @@ generation_defaults:
   split_text: true
   chunk_size: 120
 ui_state:
-  last_text: "[S1] Hey, how's it going?
-
-    [S2] Pretty good! Just grabbing some coffee. You?
-
-    [S1] Same here. Need the fuel! (laughs)
-
-    "
-  last_voice_mode: predefined
-  last_predefined_voice: Michael_Emily.wav
-  last_reference_file: none
+  last_text: Hey, how's it going?
+  last_voice_mode: clone
+  last_predefined_voice: none
+  last_reference_file: FBP_snippet.wav
   last_seed: 42
   last_chunk_size: 120
   last_split_text_enabled: true
