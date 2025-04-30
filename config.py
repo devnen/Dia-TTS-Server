@@ -31,7 +31,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "repo_id": "ttj/dia-1.6b-safetensors",
         "config_filename": "config.json",
         "weights_filename": "dia-v0_1_bf16.safetensors",
-        "whisper_model_name": "small.en",  # Added Whisper model here
+        "whisper_model_name": "small.en",
     },
     "paths": {
         "model_cache": "./model_cache",

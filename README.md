@@ -408,3 +408,12 @@ You can find it here: [https://opensource.org/licenses/MIT](https://opensource.o
     *   [Tailwind CSS](https://tailwindcss.com/) (via CDN)
 
 ---
+
+## Todos:
+- Dockerfile optimisation
+  - Bump CUDA versions
+  - Use runtime instead of devel build
+  - at multi-stage build
+- Model compile optimization
+- k8s deployment, hpa, helm chart
+- auto config at startup

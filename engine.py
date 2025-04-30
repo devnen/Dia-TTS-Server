@@ -174,7 +174,12 @@ def load_model():
     Downloads model files based on configuration if they don't exist locally.
     Handles both .pth and .safetensors formats via the underlying Dia class.
     """
-    global dia_model, model_config_instance, model_device, MODEL_LOADED, EXPECTED_SAMPLE_RATE
+    global \
+        dia_model, \
+        model_config_instance, \
+        model_device, \
+        MODEL_LOADED, \
+        EXPECTED_SAMPLE_RATE
 
     if MODEL_LOADED:
         logger.info("Dia model already loaded.")
@@ -188,7 +193,7 @@ def load_model():
     model_device = get_device()
     compute_dtype_str = get_compute_dtype(model_device)  # Determine compute dtype
 
-    logger.info(f"Attempting to load Dia model:")
+    logger.info("Attempting to load Dia model:")
     logger.info(f"  Repo ID: {repo_id}")
     logger.info(f"  Config File: {config_filename}")
     logger.info(f"  Weights File: {weights_filename}")

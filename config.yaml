@@ -1,0 +1,38 @@
+server:
+  host: 0.0.0.0
+  port: 8003
+model:
+  repo_id: ttj/dia-1.6b-safetensors
+  config_filename: config.json
+  weights_filename: dia-v0_1.safetensors
+  whisper_model_name: small.en
+paths:
+  model_cache: ./model_cache
+  reference_audio: ./reference_audio
+  output: ./outputs
+  voices: ./voices
+generation_defaults:
+  speed_factor: 0.9
+  cfg_scale: 3.0
+  temperature: 1.3
+  top_p: 0.95
+  cfg_filter_top_k: 35
+  seed: 42
+  split_text: true
+  chunk_size: 120
+ui_state:
+  last_text: "[S1] Hey, how's it going?
+
+    [S2] Pretty good! Just grabbing some coffee. You?
+
+    [S1] Same here. Need the fuel! (laughs)
+
+    "
+  last_voice_mode: predefined
+  last_predefined_voice: Michael_Emily.wav
+  last_reference_file: none
+  last_seed: 42
+  last_chunk_size: 120
+  last_split_text_enabled: true
+  hide_chunk_warning: false
+  hide_generation_warning: false

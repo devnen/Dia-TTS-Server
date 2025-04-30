@@ -5,7 +5,9 @@
 __pycache__/
 .dist
 .idea
-
+outputs
+reference_audio
+.env
 # Ignore development tools
 .vscode/
 .venv
