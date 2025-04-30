@@ -13,8 +13,11 @@ services:
       - model_cache:/app/model_cache
       - ./reference_audio:/app/reference_audio
       - ./outputs:/app/outputs
+
+      - ./voices:/app/voices
+      - ./config.yaml:/app/config.yaml
     devices:
-    - nvidia.com/gpu=all
+      - nvidia.com/gpu=all
     device_cgroup_rules:
       - "c 195:* rmw"
       - "c 236:* rmw"

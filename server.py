@@ -7,9 +7,8 @@ import time
 import os
 import io
 import uuid
-import sys
-import shutil  # For file copying
-import yaml  # For loading presets
+import shutil
+import yaml  # Keep yaml import for potential future use, though config handles it now
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional, Literal, List, Dict, Any
@@ -26,6 +25,7 @@ from fastapi import (
     UploadFile,
     File,
     BackgroundTasks,
+    Depends,  # Added Depends for potential future use
 )
 from fastapi.responses import (
     StreamingResponse,
@@ -40,24 +40,31 @@ import numpy as np
 
 # Internal imports
 from config import (
-    config_manager,
+    config_manager,  # Use the singleton instance
     get_host,
     get_port,
     get_output_path,
     get_reference_audio_path,
-    # register_config_routes is now defined locally
     get_model_cache_path,
+    get_predefined_voices_path,
     get_model_repo_id,
     get_model_config_filename,
     get_model_weights_filename,
-    # Generation default getters
+    get_whisper_model_name,
+    # Generation default getters (still useful for API defaults)
     get_gen_default_speed_factor,
     get_gen_default_cfg_scale,
     get_gen_default_temperature,
     get_gen_default_top_p,
     get_gen_default_cfg_filter_top_k,
-    DEFAULT_CONFIG,
+    get_gen_default_seed,
+    get_gen_default_split_text,
+    get_gen_default_chunk_size,
+    CONFIG_FILE_PATH,
+    ENV_FILE_PATH,
 )
+
+# Import updated request models
 from models import OpenAITTSRequest, CustomTTSRequest, ErrorResponse
 import engine
 from engine import (
@@ -65,130 +72,72 @@ from engine import (
     generate_speech,
     EXPECTED_SAMPLE_RATE,
 )
-from utils import encode_audio, save_audio_to_file, PerformanceMonitor
+from utils import (
+    encode_audio,
+    save_audio_to_file,
+    PerformanceMonitor,
+    sanitize_filename,
+    get_valid_reference_files,  # Import helper from utils
+    get_predefined_voices,  # Import helper from utils
+)
 
-# Configure logging (Basic setup, can be enhanced)
+# Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 # Reduce verbosity of noisy libraries if needed
-# logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-# logging.getLogger("watchfiles").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)  # Logger for this module
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
+# Set tqdm logging level higher to avoid interfering with progress bar
+logging.getLogger("tqdm").setLevel(logging.WARNING)
+# Set whisper logging level higher
+logging.getLogger("whisper").setLevel(logging.WARNING)
+# Set parselmouth logging level higher
+logging.getLogger("parselmouth").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 # --- Global Variables & Constants ---
-PRESETS_FILE = "ui/presets.yaml"
-loaded_presets: List[Dict[str, Any]] = []  # Cache presets in memory
+# Presets are now loaded directly in the UI route if needed, or managed differently
+# PRESETS_FILE = "ui/presets.yaml" # No longer needed here
+# loaded_presets: List[Dict[str, Any]] = [] # No longer needed here
 startup_complete_event = threading.Event()
 
-# --- Helper Functions ---
-
-
-def load_presets():
-    """Loads presets from the YAML file."""
-    global loaded_presets
-    try:
-        if os.path.exists(PRESETS_FILE):
-            with open(PRESETS_FILE, "r", encoding="utf-8") as f:
-                loaded_presets = yaml.safe_load(f)
-                if not isinstance(loaded_presets, list):
-                    logger.error(
-                        f"Presets file '{PRESETS_FILE}' should contain a list, but found {type(loaded_presets)}. No presets loaded."
-                    )
-                    loaded_presets = []
-                else:
-                    logger.info(
-                        f"Successfully loaded {len(loaded_presets)} presets from {PRESETS_FILE}."
-                    )
-        else:
-            logger.warning(
-                f"Presets file not found at '{PRESETS_FILE}'. No presets will be available."
-            )
-            loaded_presets = []
-    except yaml.YAMLError as e:
-        logger.error(
-            f"Error parsing presets YAML file '{PRESETS_FILE}': {e}", exc_info=True
-        )
-        loaded_presets = []
-    except Exception as e:
-        logger.error(f"Error loading presets file '{PRESETS_FILE}': {e}", exc_info=True)
-        loaded_presets = []
-
-
-def get_valid_reference_files() -> list[str]:
-    """Gets a list of valid audio files (.wav, .mp3) from the reference directory."""
-    ref_path = get_reference_audio_path()
-    valid_files = []
-    allowed_extensions = (".wav", ".mp3")
-    try:
-        if os.path.isdir(ref_path):
-            for filename in os.listdir(ref_path):
-                if filename.lower().endswith(allowed_extensions):
-                    # Optional: Add check for file size or basic validity if needed
-                    valid_files.append(filename)
-        else:
-            logger.warning(f"Reference audio directory not found: {ref_path}")
-    except Exception as e:
-        logger.error(
-            f"Error reading reference audio directory '{ref_path}': {e}", exc_info=True
-        )
-    return sorted(valid_files)
-
-
-def sanitize_filename(filename: str) -> str:
-    """Removes potentially unsafe characters and path components from a filename."""
-    # Remove directory separators
-    filename = os.path.basename(filename)
-    # Keep only alphanumeric, underscore, hyphen, dot. Replace others with underscore.
-    safe_chars = set(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-    )
-    sanitized = "".join(c if c in safe_chars else "_" for c in filename)
-    # Prevent names starting with dot or consisting only of dots/spaces
-    if not sanitized or sanitized.lstrip("._ ") == "":
-        return f"uploaded_file_{uuid.uuid4().hex[:8]}"  # Generate a safe fallback name
-    # Limit length
-    max_len = 100
-    if len(sanitized) > max_len:
-        name, ext = os.path.splitext(sanitized)
-        sanitized = name[: max_len - len(ext)] + ext
-    return sanitized
+# --- Helper Functions (Moved relevant ones to utils.py) ---
+# get_valid_reference_files is now in utils.py
+# get_predefined_voices is now in utils.py
 
 
 # --- Application Lifespan (Startup/Shutdown) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup/shutdown."""
-    model_loaded_successfully = False  # Flag to track success
+    model_loaded_successfully = False
     try:
         logger.info("Starting Dia TTS server initialization...")
-        # Ensure base directories exist
+        # Config is loaded automatically by config_manager instance creation
+        logger.info(
+            f"Configuration loaded from {CONFIG_FILE_PATH if os.path.exists(CONFIG_FILE_PATH) else 'defaults/env'}."
+        )
+
+        # Ensure base directories exist based on loaded config
         os.makedirs(get_output_path(), exist_ok=True)
         os.makedirs(get_reference_audio_path(), exist_ok=True)
         os.makedirs(get_model_cache_path(), exist_ok=True)
+        os.makedirs(
+            get_predefined_voices_path(), exist_ok=True
+        )  # Ensure voices dir exists
         os.makedirs("ui", exist_ok=True)
-        os.makedirs("static", exist_ok=True)
-
-        # Load presets from YAML file
-        load_presets()
 
         # Load the main TTS model during startup
         if not load_dia_model():
-            # Model loading failed
-            error_msg = (
-                "CRITICAL: Failed to load Dia model on startup. Server cannot start."
-            )
+            error_msg = "CRITICAL: Failed to load Dia model on startup. Server cannot function correctly."
             logger.critical(error_msg)
-            # Option 1: Raise an exception to stop Uvicorn startup cleanly
-            raise RuntimeError(error_msg)
-            # Option 2: Force exit (less clean, might bypass some Uvicorn shutdown)
-            # sys.exit(1)
+            # Allow server to start but log critical error. Endpoints will fail later.
         else:
             logger.info("Dia model loaded successfully.")
             model_loaded_successfully = True
 
-            # Create and start a delayed browser opening thread
-            # IMPORTANT: Create this thread AFTER model loading completes
+            # Create and start a delayed browser opening thread only if model loaded
             host = get_host()
             port = get_port()
             browser_thread = threading.Thread(
@@ -196,21 +145,15 @@ async def lifespan(app: FastAPI):
             )
             browser_thread.start()
 
-        # --- Signal completion AFTER potentially long operations ---
         logger.info("Application startup sequence finished. Signaling readiness.")
         startup_complete_event.set()
 
         yield  # Application runs here
 
     except Exception as e:
-        # Catch the RuntimeError we raised or any other startup error
         logger.error(f"Fatal error during application startup: {e}", exc_info=True)
-        # Do NOT set the event here if startup failed
-        # Re-raise the exception or exit to ensure the server stops
-        raise e  # Re-raising ensures Uvicorn knows startup failed
-        # Alternatively: sys.exit(1)
+        startup_complete_event.set()  # Ensure event is set even on error
     finally:
-        # Cleanup on shutdown
         logger.info("Application shutdown initiated...")
         # Add any specific cleanup needed
         logger.info("Application shutdown complete.")
@@ -219,231 +162,179 @@ async def lifespan(app: FastAPI):
 def _delayed_browser_open(host, port):
     """Opens browser after a short delay to ensure server is ready"""
     try:
-        # Small delay to ensure Uvicorn is fully ready
+        startup_complete_event.wait(timeout=300)
+        if not startup_complete_event.is_set():
+            logger.warning(
+                "Startup did not complete within timeout. Browser will not be opened automatically."
+            )
+            return
         time.sleep(2)
-
         display_host = "localhost" if host == "0.0.0.0" else host
         browser_url = f"http://{display_host}:{port}/"
-
-        # Log to file for debugging
-        with open("browser_thread_debug.log", "a") as f:
-            f.write(f"[{time.time()}] Opening browser at {browser_url}\n")
-
-        # Try to use logger as well (might work at this point)
-        try:
-            logger.info(f"Opening browser at {browser_url}")
-        except:
-            pass
-
-        # Open browser directly without health checks
+        logger.info(f"Attempting to open browser at {browser_url}")
         webbrowser.open(browser_url)
-
     except Exception as e:
-        with open("browser_thread_debug.log", "a") as f:
-            f.write(f"[{time.time()}] Browser open error: {str(e)}\n")
+        logger.error(f"Failed to open browser automatically: {e}", exc_info=True)
 
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Dia TTS Server",
     description="Text-to-Speech server using the Dia model, providing API and Web UI.",
-    version="1.1.0",  # Incremented version
+    version="1.4.0",  # Incremented version for config.yaml changes
     lifespan=lifespan,
 )
 
-# List of folders to check/create
-folders = ["reference_audio", "model_cache", "outputs"]
+# Check/Create necessary folders on startup (redundant with lifespan but safe)
+folders_to_check = [
+    get_output_path(),
+    get_reference_audio_path(),
+    get_model_cache_path(),
+    get_predefined_voices_path(),
+    "ui",
+]
+for folder in folders_to_check:
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"Could not create directory '{folder}': {e}")
 
-# Check each folder and create if it doesn't exist
-for folder in folders:
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-        print(f"Created directory: {folder}")
 
 # --- Static Files and Templates ---
-# Serve generated audio files from the configured output path
-app.mount("/outputs", StaticFiles(directory=get_output_path()), name="outputs")
-# Serve UI files (CSS, JS) from the 'ui' directory
-app.mount("/ui", StaticFiles(directory="ui"), name="ui_static")
-# Initialize Jinja2 templates to look in the 'ui' directory
+try:
+    app.mount("/outputs", StaticFiles(directory=get_output_path()), name="outputs")
+except RuntimeError as e:
+    logger.error(
+        f"Failed to mount /outputs directory '{get_output_path()}': {e}. Output files may not be accessible via URL."
+    )
+try:
+    app.mount("/ui", StaticFiles(directory="ui"), name="ui_static")
+except RuntimeError as e:
+    logger.error(f"Failed to mount /ui directory: {e}. Web UI assets may not load.")
+
 templates = Jinja2Templates(directory="ui")
 
 
-# --- Configuration Routes Definition ---
-# Defined locally now instead of importing from config.py
-def register_config_routes(app: FastAPI):
-    """Adds configuration management endpoints to the FastAPI app."""
-    logger.info(
-        "Registering configuration routes (/get_config, /save_config, /restart_server, /save_generation_defaults)."
-    )
+# --- Configuration Routes (New YAML-based) ---
+@app.post(
+    "/save_settings",
+    tags=["Configuration"],
+    summary="Save partial configuration updates",
+)
+async def save_settings(request: Request):
+    """
+    Saves partial configuration updates (e.g., UI state, generation defaults,
+    server settings) to the config.yaml file. Merges the update with the
+    current configuration. Server restart is required for some settings (server, model, paths).
+    """
+    logger.info("Request received for /save_settings")
+    try:
+        partial_update = await request.json()
+        if not isinstance(partial_update, dict):
+            raise ValueError("Request body must be a JSON object.")
+        logger.debug(f"Received partial config data to save: {partial_update}")
 
-    @app.get(
-        "/get_config",
-        tags=["Configuration"],
-        summary="Get current server configuration",
-    )
-    async def get_current_config():
-        """Returns the current server configuration values (from .env or defaults)."""
-        logger.info("Request received for /get_config")
-        return JSONResponse(content=config_manager.get_all())
+        if config_manager.update_and_save(partial_update):
+            # Determine if restart is likely needed based on keys updated
+            restart_needed = any(
+                k in partial_update for k in ["server", "model", "paths"]
+            )
+            message = "Settings saved successfully."
+            if restart_needed:
+                message += " Server restart required to apply all changes."
 
-    @app.post(
-        "/save_config", tags=["Configuration"], summary="Save server configuration"
-    )
-    async def save_new_config(request: Request):
-        """
-        Saves updated server configuration values (Host, Port, Model paths, etc.)
-        to the .env file. Requires server restart to apply most changes.
-        """
-        logger.info("Request received for /save_config")
-        try:
-            new_config_data = await request.json()
-            if not isinstance(new_config_data, dict):
-                raise ValueError("Request body must be a JSON object.")
-            logger.debug(f"Received server config data to save: {new_config_data}")
-
-            # Filter data to only include keys present in DEFAULT_CONFIG
-            filtered_data = {
-                k: v for k, v in new_config_data.items() if k in DEFAULT_CONFIG
-            }
-            unknown_keys = set(new_config_data.keys()) - set(filtered_data.keys())
-            if unknown_keys:
-                logger.warning(
-                    f"Ignoring unknown keys in save_config request: {unknown_keys}"
-                )
-
-            config_manager.update(filtered_data)  # Update in memory first
-            if config_manager.save():  # Attempt to save to .env
-                logger.info("Server configuration saved successfully to .env.")
-                return JSONResponse(
-                    content={
-                        "message": "Server configuration saved. Restart server to apply changes."
-                    }
-                )
-            else:
-                logger.error("Failed to save server configuration to .env file.")
-                raise HTTPException(
-                    status_code=500, detail="Failed to save configuration file."
-                )
-        except ValueError as ve:
-            logger.error(f"Invalid data format for /save_config: {ve}")
+            return JSONResponse(
+                content={"message": message, "restart_needed": restart_needed}
+            )
+        else:
+            logger.error("Failed to save configuration via config_manager.")
             raise HTTPException(
-                status_code=400, detail=f"Invalid request data: {str(ve)}"
+                status_code=500, detail="Failed to save configuration file."
             )
-        except Exception as e:
-            logger.error(f"Error processing /save_config request: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=500, detail=f"Internal server error during save: {str(e)}"
-            )
-
-    @app.post(
-        "/save_generation_defaults",
-        tags=["Configuration"],
-        summary="Save default generation parameters",
-    )
-    async def save_generation_defaults(request: Request):
-        """
-        Saves the provided generation parameters (speed, cfg, temp, etc.)
-        as the new defaults in the .env file. These are loaded by the UI on startup.
-        """
-        logger.info("Request received for /save_generation_defaults")
-        try:
-            gen_params = await request.json()
-            if not isinstance(gen_params, dict):
-                raise ValueError("Request body must be a JSON object.")
-            logger.debug(f"Received generation defaults to save: {gen_params}")
-
-            # Map received keys (e.g., 'speed_factor') to .env keys (e.g., 'GEN_DEFAULT_SPEED_FACTOR')
-            defaults_to_save = {}
-            key_map = {
-                "speed_factor": "GEN_DEFAULT_SPEED_FACTOR",
-                "cfg_scale": "GEN_DEFAULT_CFG_SCALE",
-                "temperature": "GEN_DEFAULT_TEMPERATURE",
-                "top_p": "GEN_DEFAULT_TOP_P",
-                "cfg_filter_top_k": "GEN_DEFAULT_CFG_FILTER_TOP_K",
-            }
-            valid_keys_found = False
-            for ui_key, env_key in key_map.items():
-                if ui_key in gen_params:
-                    # Basic validation could be added here (e.g., check if float/int)
-                    defaults_to_save[env_key] = str(
-                        gen_params[ui_key]
-                    )  # Ensure saving as string
-                    valid_keys_found = True
-                else:
-                    logger.warning(
-                        f"Missing expected key '{ui_key}' in save_generation_defaults request."
-                    )
-
-            if not valid_keys_found:
-                raise ValueError("No valid generation parameters found in the request.")
-
-            config_manager.update(defaults_to_save)  # Update in memory
-            if (
-                config_manager.save()
-            ):  # Save all current config (including these) to .env
-                logger.info("Generation defaults saved successfully to .env.")
-                return JSONResponse(content={"message": "Generation defaults saved."})
-            else:
-                logger.error("Failed to save generation defaults to .env file.")
-                raise HTTPException(
-                    status_code=500, detail="Failed to save configuration file."
-                )
-        except ValueError as ve:
-            logger.error(f"Invalid data format for /save_generation_defaults: {ve}")
-            raise HTTPException(
-                status_code=400, detail=f"Invalid request data: {str(ve)}"
-            )
-        except Exception as e:
-            logger.error(
-                f"Error processing /save_generation_defaults request: {e}",
-                exc_info=True,
-            )
-            raise HTTPException(
-                status_code=500, detail=f"Internal server error during save: {str(e)}"
-            )
-
-    @app.post(
-        "/restart_server",
-        tags=["Configuration"],
-        summary="Attempt to restart the server",
-    )
-    async def trigger_server_restart(background_tasks: BackgroundTasks):
-        """
-        Attempts to restart the server process.
-        NOTE: This is highly dependent on how the server is run (e.g., with uvicorn --reload,
-        or managed by systemd/supervisor). A simple exit might just stop the process.
-        This implementation attempts a clean exit, relying on the runner to restart it.
-        """
-        logger.warning("Received request to restart server via API.")
-
-        def _do_restart():
-            time.sleep(1)  # Short delay to allow response to be sent
-            logger.warning("Attempting clean exit for restart...")
-            # Option 1: Clean exit (relies on Uvicorn reload or process manager)
-            sys.exit(0)
-            # Option 2: Forceful re-execution (use with caution, might not work as expected)
-            # try:
-            #     logger.warning("Attempting os.execv for restart...")
-            #     os.execv(sys.executable, ['python'] + sys.argv)
-            # except Exception as exec_e:
-            #      logger.error(f"os.execv failed: {exec_e}. Server may not restart automatically.")
-            #      # Fallback to sys.exit if execv fails
-            #      sys.exit(1)
-
-        background_tasks.add_task(_do_restart)
-        return JSONResponse(
-            content={
-                "message": "Restart signal sent. Server should restart shortly if run with auto-reload."
-            }
+    except ValueError as ve:
+        logger.error(f"Invalid data format for /save_settings: {ve}")
+        raise HTTPException(status_code=400, detail=f"Invalid request data: {str(ve)}")
+    except Exception as e:
+        logger.error(f"Error processing /save_settings request: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Internal server error during save: {str(e)}"
         )
 
 
-# --- Register Configuration Routes ---
-register_config_routes(app)
+@app.post(
+    "/reset_settings",
+    tags=["Configuration"],
+    summary="Reset configuration to defaults",
+)
+async def reset_settings():
+    """
+    Resets the configuration in config.yaml back to the hardcoded defaults,
+    potentially overridden by values found in the .env file (if it exists).
+    """
+    logger.warning("Received request to reset configuration via API.")
+    try:
+        if config_manager.reset_and_save():
+            logger.info(
+                "Configuration reset to defaults (with .env overrides) and saved."
+            )
+            return JSONResponse(
+                content={
+                    "message": "Configuration reset successfully. Reload page or restart server."
+                }
+            )
+        else:
+            logger.error("Failed to reset and save configuration.")
+            raise HTTPException(
+                status_code=500, detail="Failed to reset configuration file."
+            )
+    except Exception as e:
+        logger.error(f"Error processing /reset_settings request: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Internal server error during reset: {str(e)}"
+        )
 
 
-# --- API Endpoints ---
+# --- Helper Endpoints for UI ---
+@app.get(
+    "/get_reference_files",
+    tags=["UI Helpers"],
+    summary="Get list of reference audio files",
+)
+async def get_reference_files_endpoint():
+    """Returns a list of valid reference audio filenames (.wav, .mp3)."""
+    logger.debug("Request received for /get_reference_files")
+    try:
+        files = get_valid_reference_files()
+        return JSONResponse(content=files)
+    except Exception as e:
+        logger.error(f"Error getting reference files: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Failed to retrieve reference files."
+        )
+
+
+@app.get(
+    "/get_predefined_voices",
+    tags=["UI Helpers"],
+    summary="Get list of predefined voices",
+)
+async def get_predefined_voices_endpoint():
+    """
+    Returns a list of predefined voices found in the voices directory.
+    Format: [{"display_name": "Formatted Name", "filename": "original_file.wav"}, ...]
+    """
+    logger.debug("Request received for /get_predefined_voices")
+    try:
+        voices = get_predefined_voices()
+        return JSONResponse(content=voices)
+    except Exception as e:
+        logger.error(f"Error getting predefined voices: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Failed to retrieve predefined voices."
+        )
+
+
+# --- API Endpoints (TTS Generation) ---
 
 
 @app.post(
@@ -451,84 +342,150 @@ register_config_routes(app)
     response_class=StreamingResponse,
     tags=["TTS Generation"],
     summary="Generate speech (OpenAI compatible)",
+    responses={
+        200: {"content": {"audio/opus": {}, "audio/wav": {}}},
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
 )
 async def openai_tts_endpoint(request: OpenAITTSRequest):
     """
     Generates speech audio from text, compatible with the OpenAI TTS API structure.
     Maps the 'voice' parameter to Dia's voice modes ('S1', 'S2', 'dialogue', or filename for clone).
+    Uses default generation parameters from config.yaml unless overridden by future API extensions.
     """
+    if not engine.MODEL_LOADED:
+        raise HTTPException(
+            status_code=503,
+            detail="Model not loaded. Server is starting or encountered an error.",
+        )
+
     monitor = PerformanceMonitor()
     monitor.record("Request received")
     logger.info(
-        f"Received OpenAI request: voice='{request.voice}', speed={request.speed}, format='{request.response_format}'"
+        f"Received OpenAI request: voice='{request.voice}', speed={request.speed}, format='{request.response_format}', seed={request.seed}"
     )
     logger.debug(f"Input text (start): '{request.input[:100]}...'")
 
-    voice_mode = "single_s1"  # Default if mapping fails
+    voice_mode = "single_s1"  # Default
     clone_ref_file = None
+    predefined_voice_file = None  # Added for potential future mapping
     ref_path = get_reference_audio_path()
+    predefined_path = get_predefined_voices_path()
 
-    # --- Map OpenAI 'voice' parameter to Dia's modes ---
+    # Map OpenAI 'voice' parameter
     voice_param = request.voice.strip()
-    if voice_param.lower() == "dialogue":
-        voice_mode = "dialogue"
-    elif voice_param.lower() == "s1":
-        voice_mode = "single_s1"
-    elif voice_param.lower() == "s2":
-        voice_mode = "single_s2"
-    # Check if it looks like a filename for cloning (allow .wav or .mp3)
-    elif voice_param.lower().endswith((".wav", ".mp3")):
-        potential_path = os.path.join(ref_path, voice_param)
-        # Check if the file actually exists in the reference directory
-        if os.path.isfile(potential_path):
-            voice_mode = "clone"
-            clone_ref_file = voice_param  # Use the provided filename
+
+    # Check predefined voices first (case-insensitive match on display name or filename)
+    # This requires getting the list of predefined voices
+    predefined_voices = (
+        get_predefined_voices()
+    )  # List of {"display_name": "...", "filename": "..."}
+    found_predefined = False
+    for voice_info in predefined_voices:
+        # Match against display name (case-insensitive) or filename (case-insensitive)
+        if (
+            voice_param.lower() == voice_info["display_name"].lower()
+            or voice_param.lower() == voice_info["filename"].lower()
+        ):
+            voice_mode = "predefined"  # Treat as predefined internally
+            predefined_voice_file = voice_info["filename"]  # Use the original filename
             logger.info(
-                f"OpenAI request mapped to clone mode with file: {clone_ref_file}"
+                f"OpenAI request mapped to predefined voice: {predefined_voice_file}"
             )
+            found_predefined = True
+            break
+
+    if not found_predefined:
+        # If not predefined, check standard modes or reference files
+        if voice_param.lower() == "dialogue":
+            voice_mode = "dialogue"
+        elif voice_param.lower() == "s1":
+            voice_mode = "single_s1"
+        elif voice_param.lower() == "s2":
+            voice_mode = "single_s2"
+        elif voice_param.lower().endswith((".wav", ".mp3")):
+            # Check if file exists in reference audio path
+            potential_path = os.path.join(ref_path, voice_param)
+            if os.path.isfile(potential_path):
+                voice_mode = "clone"
+                clone_ref_file = voice_param
+                logger.info(
+                    f"OpenAI request mapped to clone mode with file: {clone_ref_file}"
+                )
+            else:
+                logger.error(
+                    f"Reference file '{voice_param}' specified in OpenAI request not found in '{ref_path}'. Cannot use clone mode."
+                )
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Reference audio file '{voice_param}' not found on server for cloning.",
+                )
         else:
             logger.warning(
-                f"Reference file '{voice_param}' specified in OpenAI request not found in '{ref_path}'. Defaulting voice mode."
+                f"Unrecognized OpenAI voice parameter '{voice_param}'. Defaulting voice mode to 'single_s1'."
             )
-            # Fallback to default 'single_s1' if file not found
-    else:
-        logger.warning(
-            f"Unrecognized OpenAI voice parameter '{voice_param}'. Defaulting voice mode to 'single_s1'."
-        )
-        # Fallback for any other value
+            voice_mode = "single_s1"  # Explicitly set default
 
     monitor.record("Parameters processed")
 
     try:
-        # Call the core engine function using mapped parameters
+        # Determine the actual reference file path based on mode
+        reference_file_for_engine = None
+        if voice_mode == "clone" and clone_ref_file:
+            reference_file_for_engine = os.path.join(ref_path, clone_ref_file)
+        elif voice_mode == "predefined" and predefined_voice_file:
+            reference_file_for_engine = os.path.join(
+                predefined_path, predefined_voice_file
+            )
+            # For engine, treat predefined as a clone using the specific file
+            voice_mode_for_engine = "clone"
+        else:
+            voice_mode_for_engine = voice_mode  # Use dialogue, single_s1, single_s2
+
+        # Call the core engine function using mapped parameters and defaults from config.yaml
         result = generate_speech(
-            text=request.input,
-            voice_mode=voice_mode,
-            clone_reference_filename=clone_ref_file,
-            speed_factor=request.speed,  # Pass speed factor for post-processing
-            # Use Dia's configured defaults for other generation params unless mapped
-            max_tokens=None,  # Let Dia use its default unless specified otherwise
-            cfg_scale=get_gen_default_cfg_scale(),  # Use saved defaults
+            text_to_process=request.input,
+            voice_mode=voice_mode_for_engine,  # Pass mode adjusted for engine
+            clone_reference_filename=reference_file_for_engine,  # Pass full path or None
+            transcript=None,  # OpenAI API doesn't support explicit transcript
+            speed_factor=request.speed,
+            seed=request.seed,
+            # Use Dia's configured defaults for other generation params
+            max_tokens=None,
+            cfg_scale=get_gen_default_cfg_scale(),
             temperature=get_gen_default_temperature(),
             top_p=get_gen_default_top_p(),
             cfg_filter_top_k=get_gen_default_cfg_filter_top_k(),
+            split_text=get_gen_default_split_text(),  # Use configured default
+            chunk_size=get_gen_default_chunk_size(),  # Use configured default
+            # Use default post-processing settings
+            enable_silence_trimming=True,
+            enable_internal_silence_fix=True,
+            enable_unvoiced_removal=True,
         )
         monitor.record("Generation complete")
 
         if result is None:
             logger.error("Speech generation failed (engine returned None).")
-            raise HTTPException(status_code=500, detail="Speech generation failed.")
+            if voice_mode_for_engine == "clone":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cloning preparation failed. Check server logs (e.g., missing transcript/Whisper failure).",
+                )
+            else:
+                raise HTTPException(status_code=500, detail="Speech generation failed.")
 
         audio_array, sample_rate = result
 
         if sample_rate != EXPECTED_SAMPLE_RATE:
             logger.warning(
-                f"Engine returned sample rate {sample_rate}, but expected {EXPECTED_SAMPLE_RATE}. Encoding might assume {EXPECTED_SAMPLE_RATE}."
+                f"Engine returned sample rate {sample_rate}, expected {EXPECTED_SAMPLE_RATE}. Encoding will use {EXPECTED_SAMPLE_RATE}."
             )
-            # Use EXPECTED_SAMPLE_RATE for encoding as it's what the model is trained for
             sample_rate = EXPECTED_SAMPLE_RATE
 
-        # Encode the audio in memory to the requested format
         encoded_audio = encode_audio(audio_array, sample_rate, request.response_format)
         monitor.record("Audio encoding complete")
 
@@ -539,26 +496,20 @@ async def openai_tts_endpoint(request: OpenAITTSRequest):
                 detail=f"Failed to encode audio to {request.response_format}",
             )
 
-        # Determine the correct media type for the response header
         media_type = "audio/opus" if request.response_format == "opus" else "audio/wav"
-        # Note: OpenAI uses audio/opus, not audio/ogg;codecs=opus. Let's match OpenAI.
-
         logger.info(
             f"Successfully generated {len(encoded_audio)} bytes in format {request.response_format}"
         )
         logger.debug(monitor.report())
 
-        # Stream the encoded audio back to the client
         return StreamingResponse(io.BytesIO(encoded_audio), media_type=media_type)
 
     except HTTPException as http_exc:
-        # Re-raise HTTPExceptions directly (e.g., from parameter validation)
         logger.error(f"HTTP exception during OpenAI request: {http_exc.detail}")
         raise http_exc
     except Exception as e:
         logger.error(f"Error processing OpenAI TTS request: {e}", exc_info=True)
         logger.debug(monitor.report())
-        # Return generic server error for unexpected issues
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
@@ -567,27 +518,44 @@ async def openai_tts_endpoint(request: OpenAITTSRequest):
     response_class=StreamingResponse,
     tags=["TTS Generation"],
     summary="Generate speech (Custom parameters)",
+    responses={
+        200: {"content": {"audio/opus": {}, "audio/wav": {}}},
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
 )
 async def custom_tts_endpoint(request: CustomTTSRequest):
     """
-    Generates speech audio from text using explicit Dia parameters.
+    Generates speech audio from text using explicit Dia parameters,
+    including text splitting options and optional transcript for cloning.
+    Handles 'predefined' voice mode by mapping to 'clone' with correct path.
     """
+    if not engine.MODEL_LOADED:
+        raise HTTPException(
+            status_code=503,
+            detail="Model not loaded. Server is starting or encountered an error.",
+        )
+
     monitor = PerformanceMonitor()
     monitor.record("Request received")
     logger.info(
-        f"Received custom TTS request: mode='{request.voice_mode}', format='{request.output_format}'"
+        f"Received custom TTS request: mode='{request.voice_mode}', format='{request.output_format}', seed={request.seed}, split={request.split_text}, chunk={request.chunk_size}, transcript_provided={request.transcript is not None}"
     )
     logger.debug(f"Input text (start): '{request.text[:100]}...'")
     logger.debug(
         f"Params: max_tokens={request.max_tokens}, cfg={request.cfg_scale}, temp={request.temperature}, top_p={request.top_p}, speed={request.speed_factor}, top_k={request.cfg_filter_top_k}"
     )
 
-    clone_ref_file = None
+    reference_file_for_engine = None
+    voice_mode_for_engine = request.voice_mode  # Start with requested mode
+
     if request.voice_mode == "clone":
         if not request.clone_reference_filename:
             raise HTTPException(
-                status_code=400,  # Bad request
-                detail="Missing 'clone_reference_filename' which is required for clone mode.",
+                status_code=400,
+                detail="Missing 'clone_reference_filename' for clone mode.",
             )
         ref_path = get_reference_audio_path()
         potential_path = os.path.join(ref_path, request.clone_reference_filename)
@@ -596,32 +564,72 @@ async def custom_tts_endpoint(request: CustomTTSRequest):
                 f"Reference audio file not found for clone mode: {potential_path}"
             )
             raise HTTPException(
-                status_code=404,  # Not found
+                status_code=404,
                 detail=f"Reference audio file not found: {request.clone_reference_filename}",
             )
-        clone_ref_file = request.clone_reference_filename
-        logger.info(f"Custom request using clone mode with file: {clone_ref_file}")
+        reference_file_for_engine = potential_path  # Use full path
+        logger.info(
+            f"Custom request using clone mode with file: {request.clone_reference_filename}"
+        )
+
+    elif request.voice_mode == "predefined":
+        if (
+            not request.clone_reference_filename
+        ):  # Use the same field to pass the predefined filename
+            raise HTTPException(
+                status_code=400,
+                detail="Missing 'clone_reference_filename' (expected predefined voice filename) for predefined mode.",
+            )
+        predefined_path = get_predefined_voices_path()
+        potential_path = os.path.join(predefined_path, request.clone_reference_filename)
+        if not os.path.isfile(potential_path):
+            logger.error(f"Predefined voice file not found: {potential_path}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Predefined voice file not found: {request.clone_reference_filename}",
+            )
+        reference_file_for_engine = potential_path  # Use full path
+        voice_mode_for_engine = "clone"  # Treat as clone for engine
+        logger.info(
+            f"Custom request using predefined mode, mapped to clone with file: {request.clone_reference_filename}"
+        )
+
+    # For dialogue, single_s1, single_s2, reference_file_for_engine remains None
 
     monitor.record("Parameters processed")
 
     try:
-        # Call the core engine function with parameters from the request
+        # Call the core engine function with all parameters from the request
         result = generate_speech(
-            text=request.text,
-            voice_mode=request.voice_mode,
-            clone_reference_filename=clone_ref_file,
-            max_tokens=request.max_tokens,  # Pass user value or None
+            text_to_process=request.text,
+            voice_mode=voice_mode_for_engine,  # Use potentially adjusted mode
+            clone_reference_filename=reference_file_for_engine,  # Pass full path or None
+            transcript=request.transcript,  # Pass the optional transcript
+            max_tokens=request.max_tokens,
             cfg_scale=request.cfg_scale,
             temperature=request.temperature,
             top_p=request.top_p,
-            speed_factor=request.speed_factor,  # For post-processing
+            speed_factor=request.speed_factor,
             cfg_filter_top_k=request.cfg_filter_top_k,
+            seed=request.seed,
+            split_text=request.split_text,
+            chunk_size=request.chunk_size,
+            # Use default post-processing settings
+            enable_silence_trimming=True,
+            enable_internal_silence_fix=True,
+            enable_unvoiced_removal=True,
         )
         monitor.record("Generation complete")
 
         if result is None:
             logger.error("Speech generation failed (engine returned None).")
-            raise HTTPException(status_code=500, detail="Speech generation failed.")
+            if voice_mode_for_engine == "clone":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cloning preparation failed. Check server logs (e.g., missing transcript/Whisper failure).",
+                )
+            else:
+                raise HTTPException(status_code=500, detail="Speech generation failed.")
 
         audio_array, sample_rate = result
 
@@ -631,7 +639,6 @@ async def custom_tts_endpoint(request: CustomTTSRequest):
             )
             sample_rate = EXPECTED_SAMPLE_RATE
 
-        # Encode the audio in memory
         encoded_audio = encode_audio(audio_array, sample_rate, request.output_format)
         monitor.record("Audio encoding complete")
 
@@ -642,15 +649,12 @@ async def custom_tts_endpoint(request: CustomTTSRequest):
                 detail=f"Failed to encode audio to {request.output_format}",
             )
 
-        # Determine media type
         media_type = "audio/opus" if request.output_format == "opus" else "audio/wav"
-
         logger.info(
             f"Successfully generated {len(encoded_audio)} bytes in format {request.output_format}"
         )
         logger.debug(monitor.report())
 
-        # Stream the response
         return StreamingResponse(io.BytesIO(encoded_audio), media_type=media_type)
 
     except HTTPException as http_exc:
@@ -669,226 +673,479 @@ async def custom_tts_endpoint(request: CustomTTSRequest):
 async def get_web_ui(request: Request):
     """Serves the main TTS web interface."""
     logger.info("Serving TTS Web UI (index.html)")
-    # Get current list of reference files for the clone dropdown
-    reference_files = get_valid_reference_files()
-    # Get current server config and default generation params
-    current_config = config_manager.get_all()
-    default_gen_params = {
-        "speed_factor": get_gen_default_speed_factor(),
-        "cfg_scale": get_gen_default_cfg_scale(),
-        "temperature": get_gen_default_temperature(),
-        "top_p": get_gen_default_top_p(),
-        "cfg_filter_top_k": get_gen_default_cfg_filter_top_k(),
-    }
+    try:
+        # Load current state from config manager
+        full_config = config_manager.get_all()
+        reference_files = get_valid_reference_files()
+        predefined_voices = get_predefined_voices()
 
-    return templates.TemplateResponse(
-        "index.html",  # Use the renamed file
-        {
+        predefined_voices_error = None
+        if not predefined_voices:
+            predefined_voices_error = (
+                "No predefined voices found in './voices' directory."
+            )
+            logger.warning(predefined_voices_error)
+            # Ensure UI state reflects this if default was 'predefined'
+            if full_config.get("ui_state", {}).get("last_voice_mode") == "predefined":
+                full_config.setdefault("ui_state", {})[
+                    "last_voice_mode"
+                ] = "dialogue"  # Fallback mode
+                full_config.setdefault("ui_state", {})["last_predefined_voice"] = None
+
+        # Load presets from file
+        loaded_presets = []  # Default to empty list
+        presets_file_path = "ui/presets.yaml"
+        try:
+            if os.path.exists(presets_file_path):
+                with open(presets_file_path, "r", encoding="utf-8") as f:
+                    yaml_content = yaml.safe_load(f)
+                    if isinstance(yaml_content, list):
+                        loaded_presets = yaml_content
+                        logger.info(
+                            f"Successfully loaded {len(loaded_presets)} presets from {presets_file_path}."
+                        )
+                    else:
+                        logger.error(
+                            f"Invalid format in {presets_file_path}. Expected a list, got {type(yaml_content)}. No presets loaded."
+                        )
+            else:
+                logger.warning(
+                    f"Presets file not found: {presets_file_path}. No presets will be available."
+                )
+        except yaml.YAMLError as e:
+            logger.error(
+                f"Error parsing presets YAML file '{presets_file_path}': {e}",
+                exc_info=True,
+            )
+        except Exception as e:
+            logger.error(
+                f"Error loading presets file '{presets_file_path}': {e}", exc_info=True
+            )
+        # Ensure loaded_presets is always a list before passing to template
+        if not isinstance(loaded_presets, list):
+            loaded_presets = []
+
+        # Create a single object for all generation result data
+        initial_gen_result = {
+            "outputUrl": None,
+            "genTime": None,
+            "submittedVoiceMode": None,
+            "submittedPredefinedVoice": None,
+            "submittedCloneFile": None,
+        }
+
+        # Pass the necessary data to the template
+        template_context = {
             "request": request,
+            "config": full_config,  # Pass the whole config object
             "reference_files": reference_files,
-            "config": current_config,  # Pass current server config
-            "presets": loaded_presets,  # Pass loaded presets
-            "default_gen_params": default_gen_params,  # Pass default gen params
-            # Add other variables needed by the template for initial state
+            "predefined_voices": predefined_voices,
+            "predefined_voices_error": predefined_voices_error,
+            "presets": loaded_presets,
+            # Pass the single generation result object
+            "initial_gen_result": initial_gen_result,
+            # Keep error/success for notifications
             "error": None,
             "success": None,
-            "output_file_url": None,
-            "generation_time": None,
-            "submitted_text": "",
-            "submitted_voice_mode": "dialogue",  # Default to combined mode
-            "submitted_clone_file": None,
-            # Initial generation params will be set by default_gen_params
-        },
-    )
+        }
+
+        return templates.TemplateResponse("index.html", template_context)
+
+    except Exception as e:
+        logger.error(f"Error rendering Web UI: {e}", exc_info=True)
+        # Fallback error page or simple response
+        return HTMLResponse(
+            "<html><body><h1>Internal Server Error</h1><p>Could not load the TTS interface. Check server logs.</p></body></html>",
+            status_code=500,
+        )
 
 
 @app.post("/web/generate", response_class=HTMLResponse, include_in_schema=False)
 async def handle_web_ui_generate(
     request: Request,
     text: str = Form(...),
-    voice_mode: Literal["dialogue", "clone"] = Form(...),  # Updated modes
-    clone_reference_select: Optional[str] = Form(None),
+    voice_mode: Literal["predefined", "clone", "dialogue"] = Form(
+        ...
+    ),  # Add predefined mode support
+    predefined_voice_select: Optional[str] = Form(
+        None
+    ),  # Filename for predefined voice
+    clone_reference_select: Optional[str] = Form(None),  # Filename for clone reference
     # Generation parameters from form
-    speed_factor: float = Form(...),  # Make required or use Depends with default
+    speed_factor: float = Form(...),
     cfg_scale: float = Form(...),
     temperature: float = Form(...),
     top_p: float = Form(...),
     cfg_filter_top_k: int = Form(...),
+    seed: int = Form(...),
+    split_text: Optional[bool] = Form(False),
+    chunk_size: Optional[int] = Form(120),  # Match default from config/UI
 ):
-    """Handles the generation request from the web UI form."""
-    logger.info(f"Web UI generation request: mode='{voice_mode}'")
+    """
+    Handles the generation request from the web UI form.
+    Validates inputs, calls the engine, saves the output, and re-renders
+    the UI template with results or errors.
+    """
+    # --- Initial check: Is the TTS engine ready? ---
+    if not engine.MODEL_LOADED:
+        logger.error("Web UI generation request received, but model is not loaded.")
+        # Re-render form with error message if model is not ready.
+        # Fetch necessary data again to populate the template correctly.
+        error_context = {
+            "request": request,
+            "error": "Model is not loaded. Please wait or check server logs.",
+            "config": config_manager.get_all(),
+            "reference_files": get_valid_reference_files(),
+            "predefined_voices": get_predefined_voices(),
+            "predefined_voices_error": (
+                None if get_predefined_voices() else "No predefined voices found."
+            ),
+            "presets": [],  # Simplified error response
+            "submitted_text": text,
+            "submitted_voice_mode": voice_mode,
+            "submitted_predefined_voice": predefined_voice_select,
+            "submitted_clone_file": clone_reference_select,
+            "submitted_gen_params": {
+                "speed_factor": speed_factor,
+                "cfg_scale": cfg_scale,
+                "temperature": temperature,
+                "top_p": top_p,
+                "cfg_filter_top_k": cfg_filter_top_k,
+                "seed": seed,
+                "split_text": split_text,
+                "chunk_size": chunk_size,
+            },
+            "success": None,
+            # Provide a default initial_gen_result even for this error case
+            "initial_gen_result": {
+                "outputUrl": None,
+                "genTime": None,
+                "submittedVoiceMode": voice_mode,
+                "submittedPredefinedVoice": predefined_voice_select,
+                "submittedCloneFile": clone_reference_select,
+            },
+            "output_file_url": None,
+            "generation_time": None,
+        }
+        return templates.TemplateResponse("index.html", error_context, status_code=503)
+
+    # --- Start processing the valid request ---
+    logger.info(
+        f"Web UI generation request: mode='{voice_mode}', seed={seed}, split={split_text}, chunk={chunk_size}"
+    )
     monitor = PerformanceMonitor()
     monitor.record("Web request received")
 
+    # Initialize variables
     output_file_url = None
     generation_time = None
     error_message = None
     success_message = None
-    output_filename_base = "dia_output"  # Default base name
+    reference_file_for_engine = None
+    voice_mode_for_engine = voice_mode
+    effective_filename_for_log = None
 
-    # --- Pre-generation Validation ---
+    # --- Pre-generation Validation & Path Setup ---
     if not text.strip():
         error_message = "Please enter some text to synthesize."
 
-    clone_ref_file = None
-    if voice_mode == "clone":
+    if not error_message and voice_mode == "clone":
         if not clone_reference_select or clone_reference_select == "none":
             error_message = "Please select a reference audio file for clone mode."
         else:
-            # Verify selected file still exists (important if files can be deleted)
             ref_path = get_reference_audio_path()
             potential_path = os.path.join(ref_path, clone_reference_select)
             if not os.path.isfile(potential_path):
                 error_message = f"Selected reference file '{clone_reference_select}' no longer exists. Please refresh or upload."
-                # Invalidate selection
-                clone_ref_file = None
-                clone_reference_select = None  # Clear submitted value for re-rendering
+                clone_reference_select = None
             else:
-                clone_ref_file = clone_reference_select
-                logger.info(f"Using selected reference file: {clone_ref_file}")
+                reference_file_for_engine = potential_path
+                effective_filename_for_log = clone_reference_select
+                logger.info(f"Using selected reference file: {clone_reference_select}")
 
-    # If validation failed, re-render the page with error and submitted values
+    elif not error_message and voice_mode == "predefined":
+        if not predefined_voice_select or predefined_voice_select == "none":
+            error_message = "Please select a predefined voice."
+        else:
+            predefined_path = get_predefined_voices_path()
+            potential_path = os.path.join(predefined_path, predefined_voice_select)
+            if not os.path.isfile(potential_path):
+                error_message = f"Selected predefined voice file '{predefined_voice_select}' no longer exists."
+                predefined_voice_select = None
+            else:
+                reference_file_for_engine = potential_path
+                voice_mode_for_engine = "clone"
+                effective_filename_for_log = predefined_voice_select
+                logger.info(
+                    f"Using selected predefined voice file: {predefined_voice_select}"
+                )
+
+    elif not error_message and voice_mode == "dialogue":
+        if not ("[S1]" in text or "[S2]" in text):
+            logger.info(
+                "Dialogue mode selected, but no [S1]/[S2] tags found. Treating as single_s1."
+            )
+            voice_mode_for_engine = "single_s1"
+
+    # --- Save UI State (if no validation errors yet) ---
+    if not error_message:
+        try:
+            ui_state_update = {
+                "ui_state": {
+                    "last_text": text,
+                    "last_voice_mode": voice_mode,
+                    "last_predefined_voice": (
+                        predefined_voice_select if voice_mode == "predefined" else None
+                    ),
+                    "last_reference_file": (
+                        clone_reference_select if voice_mode == "clone" else None
+                    ),
+                    "last_seed": seed,
+                    "last_chunk_size": chunk_size,
+                    "last_split_text_enabled": split_text,
+                }
+            }
+            if not config_manager.update_and_save(ui_state_update):
+                logger.warning("Failed to save UI state update before generation.")
+            else:
+                logger.debug("Saved UI state update before generation.")
+        except Exception as save_err:
+            logger.warning(f"Error saving UI state before generation: {save_err}")
+
+    # --- Handle Validation Errors: Re-render page ---
     if error_message:
         logger.warning(f"Web UI validation error: {error_message}")
+        # Fetch latest data for template rendering
+        full_config = config_manager.get_all()
         reference_files = get_valid_reference_files()
-        current_config = config_manager.get_all()
-        default_gen_params = {  # Pass defaults again for consistency
-            "speed_factor": get_gen_default_speed_factor(),
-            "cfg_scale": get_gen_default_cfg_scale(),
-            "temperature": get_gen_default_temperature(),
-            "top_p": get_gen_default_top_p(),
-            "cfg_filter_top_k": get_gen_default_cfg_filter_top_k(),
-        }
-        # Pass back the values the user submitted
-        submitted_gen_params = {
-            "speed_factor": speed_factor,
-            "cfg_scale": cfg_scale,
-            "temperature": temperature,
-            "top_p": top_p,
-            "cfg_filter_top_k": cfg_filter_top_k,
-        }
+        predefined_voices = get_predefined_voices()
+        loaded_presets = []
+        try:  # Reload presets
+            presets_file_path = "ui/presets.yaml"
+            if os.path.exists(presets_file_path):
+                with open(presets_file_path, "r", encoding="utf-8") as f:
+                    loaded_presets = yaml.safe_load(f) or []
+                    if not isinstance(loaded_presets, list):
+                        loaded_presets = []
+        except Exception as preset_load_err:
+            logger.warning(
+                f"Could not reload presets for error page: {preset_load_err}"
+            )
+            loaded_presets = []
 
-        return templates.TemplateResponse(
-            "index.html",
-            {
-                "request": request,
-                "error": error_message,
-                "reference_files": reference_files,
-                "config": current_config,
-                "presets": loaded_presets,
-                "default_gen_params": default_gen_params,  # Base defaults
-                # Submitted values to repopulate form
-                "submitted_text": text,
-                "submitted_voice_mode": voice_mode,
-                "submitted_clone_file": clone_reference_select,  # Use potentially invalidated value
-                "submitted_gen_params": submitted_gen_params,  # Pass submitted params back
-                # Ensure other necessary template variables are passed
-                "success": None,
-                "output_file_url": None,
-                "generation_time": None,
+        # Prepare context for the error response template
+        error_context = {
+            "request": request,
+            "error": error_message,
+            "config": full_config,
+            "reference_files": reference_files,
+            "predefined_voices": predefined_voices,
+            "predefined_voices_error": (
+                None if predefined_voices else "No predefined voices found."
+            ),
+            "presets": loaded_presets,
+            "submitted_text": text,
+            "submitted_voice_mode": voice_mode,
+            "submitted_predefined_voice": predefined_voice_select,
+            "submitted_clone_file": clone_reference_select,
+            "submitted_gen_params": {
+                "speed_factor": speed_factor,
+                "cfg_scale": cfg_scale,
+                "temperature": temperature,
+                "top_p": top_p,
+                "cfg_filter_top_k": cfg_filter_top_k,
+                "seed": seed,
+                "split_text": split_text,
+                "chunk_size": chunk_size,
             },
-        )
+            "success": None,
+            # Also provide default initial_gen_result here
+            "initial_gen_result": {
+                "outputUrl": None,
+                "genTime": None,
+                "submittedVoiceMode": voice_mode,
+                "submittedPredefinedVoice": predefined_voice_select,
+                "submittedCloneFile": clone_reference_select,
+            },
+            "output_file_url": None,
+            "generation_time": None,
+        }
+        return templates.TemplateResponse(
+            "index.html", error_context, status_code=400
+        )  # Bad Request
 
     # --- Generation ---
     try:
-        monitor.record("Parameters processed")
-        # Call the core engine function
+        monitor.record("Parameters processed, starting generation")
+        actual_chunk_size = chunk_size if chunk_size is not None else 120
+
+        # Adjust split_text based on length
+        if split_text and len(text) < actual_chunk_size * 2:
+            logger.info(
+                f"Backend disabling split_text as text length ({len(text)}) is < 2x chunk size ({actual_chunk_size})."
+            )
+            split_text = False
+
+        # Call the core speech generation function
         result = generate_speech(
-            text=text,
-            voice_mode=voice_mode,
-            clone_reference_filename=clone_ref_file,
+            text_to_process=text,
+            voice_mode=voice_mode_for_engine,
+            clone_reference_filename=reference_file_for_engine,
+            transcript=None,
             speed_factor=speed_factor,
             cfg_scale=cfg_scale,
             temperature=temperature,
             top_p=top_p,
             cfg_filter_top_k=cfg_filter_top_k,
-            max_tokens=None,  # Use model default for UI simplicity
+            seed=seed,
+            split_text=split_text,
+            chunk_size=actual_chunk_size,
+            max_tokens=None,
+            enable_silence_trimming=True,
+            enable_internal_silence_fix=True,
+            enable_unvoiced_removal=True,
         )
         monitor.record("Generation complete")
 
         if result:
+            # Process successful generation
             audio_array, sample_rate = result
             output_path_base = get_output_path()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            # Create a more descriptive filename
-            mode_tag = voice_mode
-            if voice_mode == "clone" and clone_ref_file:
-                safe_ref_name = sanitize_filename(os.path.splitext(clone_ref_file)[0])
-                mode_tag = f"clone_{safe_ref_name[:20]}"  # Limit length
-            output_filename = (
-                f"{mode_tag}_{timestamp}.wav"  # Always save as WAV for simplicity
-            )
+            mode_tag = voice_mode_for_engine
+
+            # Create descriptive filename tag
+            if voice_mode_for_engine == "clone" and effective_filename_for_log:
+                safe_ref_name = sanitize_filename(
+                    os.path.splitext(effective_filename_for_log)[0]
+                )
+                prefix = "clone" if voice_mode == "clone" else "voice"
+                mode_tag = f"{prefix}_{safe_ref_name[:20]}"
+            elif voice_mode_for_engine == "dialogue":
+                mode_tag = "dialogue"
+            elif voice_mode_for_engine == "single_s1":
+                mode_tag = "single_s1"
+            elif voice_mode_for_engine == "single_s2":
+                mode_tag = "single_s2"
+            else:
+                mode_tag = "output"
+
+            output_filename = f"{mode_tag}_{timestamp}.wav"
             output_filepath = os.path.join(output_path_base, output_filename)
 
-            # Save the audio to a WAV file
+            # Save the audio file
             saved = save_audio_to_file(audio_array, sample_rate, output_filepath)
             monitor.record("Audio saved")
 
             if saved:
-                output_file_url = (
-                    f"/outputs/{output_filename}"  # URL path for browser access
-                )
-                generation_time = (
-                    monitor.events[-1][1] - monitor.start_time
-                )  # Time until save complete
-                success_message = f"Audio generated successfully!"
+                output_file_url = f"/outputs/{output_filename}"
+                generation_time = monitor.events[-1][1] - monitor.start_time
+                success_message = "Audio generated successfully!"
                 logger.info(f"Web UI generated audio saved to: {output_filepath}")
             else:
-                error_message = "Failed to save generated audio file."
-                logger.error("Failed to save audio file from web UI request.")
+                error_message = "Failed to save generated audio file. Check server permissions and path."
+                logger.error(
+                    f"Failed to save audio file from web UI request to {output_filepath}."
+                )
         else:
-            error_message = "Speech generation failed (engine returned None)."
-            logger.error("Speech generation failed for web UI request.")
+            # Handle generation failure
+            if voice_mode_for_engine == "clone":
+                error_message = "Cloning preparation failed. Check server logs (e.g., missing transcript .txt, Whisper failure, audio issues)."
+            else:
+                error_message = "Speech generation failed (engine returned None). Check server logs."
+            logger.error(
+                f"Speech generation failed. Engine Mode: {voice_mode_for_engine}, UI Mode: {voice_mode}"
+            )
 
     except Exception as e:
+        # Catch unexpected errors
         logger.error(f"Error processing web UI TTS request: {e}", exc_info=True)
-        error_message = f"An unexpected error occurred: {str(e)}"
+        error_message = f"An unexpected error occurred during generation: {str(e)}"
 
+    # Log performance
     logger.debug(monitor.report())
 
-    # --- Re-render Template with Results ---
-    reference_files = get_valid_reference_files()
-    current_config = config_manager.get_all()
-    default_gen_params = {
-        "speed_factor": get_gen_default_speed_factor(),
-        "cfg_scale": get_gen_default_cfg_scale(),
-        "temperature": get_gen_default_temperature(),
-        "top_p": get_gen_default_top_p(),
-        "cfg_filter_top_k": get_gen_default_cfg_filter_top_k(),
+    # --- Prepare Data for Template Rendering ---
+
+    # Construct the result dictionary for JavaScript (MUST be defined)
+    initial_gen_result = {
+        "outputUrl": output_file_url,
+        "genTime": f"{generation_time:.2f}" if generation_time is not None else None,
+        "submittedVoiceMode": voice_mode,
+        "submittedPredefinedVoice": (
+            predefined_voice_select if voice_mode == "predefined" else None
+        ),
+        "submittedCloneFile": clone_reference_select if voice_mode == "clone" else None,
     }
-    # Pass back submitted values to repopulate form correctly
+
+    # Fetch latest state data for rendering
+    full_config = config_manager.get_all()
+    reference_files = get_valid_reference_files()
+    predefined_voices = get_predefined_voices()
+    loaded_presets = []
+    try:  # Reload presets
+        presets_file_path = "ui/presets.yaml"
+        if os.path.exists(presets_file_path):
+            with open(presets_file_path, "r", encoding="utf-8") as f:
+                loaded_presets = yaml.safe_load(f) or []
+                if not isinstance(loaded_presets, list):
+                    loaded_presets = []
+    except Exception as preset_load_err:
+        logger.warning(f"Could not reload presets for results page: {preset_load_err}")
+        loaded_presets = []
+
+    # Determine HTTP status code
+    status_code = 200 if success_message else 500
+    if error_message and "Cloning preparation failed" in error_message:
+        status_code = 400
+
+    # Prepare submitted generation parameters for form repopulation
     submitted_gen_params = {
         "speed_factor": speed_factor,
         "cfg_scale": cfg_scale,
         "temperature": temperature,
         "top_p": top_p,
         "cfg_filter_top_k": cfg_filter_top_k,
+        "seed": seed,
+        "split_text": split_text,  # Use potentially adjusted value
+        "chunk_size": chunk_size if chunk_size is not None else 120,
     }
 
+    # Assemble the complete context for Jinja2
+    template_context = {
+        "request": request,
+        "error": error_message,
+        "success": success_message,
+        "initial_gen_result": initial_gen_result,  # <-- Pass the structured result data
+        "config": full_config,
+        "reference_files": reference_files,
+        "predefined_voices": predefined_voices,
+        "predefined_voices_error": (
+            None if predefined_voices else "No predefined voices found."
+        ),
+        "presets": loaded_presets,
+        # Submitted values for form repopulation
+        "submitted_text": text,
+        "submitted_voice_mode": voice_mode,
+        "submitted_predefined_voice": predefined_voice_select,
+        "submitted_clone_file": clone_reference_select,
+        "submitted_gen_params": submitted_gen_params,
+        # Individual result vars (optional, as JS uses initial_gen_result)
+        "output_file_url": output_file_url,
+        "generation_time": f"{generation_time:.2f}" if generation_time else None,
+    }
+
+    # Render and return the HTML response
     return templates.TemplateResponse(
         "index.html",
-        {
-            "request": request,
-            "error": error_message,
-            "success": success_message,
-            "output_file_url": output_file_url,
-            "generation_time": f"{generation_time:.2f}" if generation_time else None,
-            "reference_files": reference_files,
-            "config": current_config,
-            "presets": loaded_presets,
-            "default_gen_params": default_gen_params,  # Base defaults
-            # Pass back submitted values
-            "submitted_text": text,
-            "submitted_voice_mode": voice_mode,
-            "submitted_clone_file": clone_ref_file,  # Pass the validated filename back
-            "submitted_gen_params": submitted_gen_params,  # Pass submitted params back
-        },
+        template_context,  # Pass the complete context dictionary
+        status_code=status_code,  # Set appropriate HTTP status
     )
 
 
 # --- Reference Audio Upload Endpoint ---
 @app.post(
-    "/upload_reference", tags=["Web UI Helpers"], summary="Upload reference audio files"
+    "/upload_reference", tags=["UI Helpers"], summary="Upload reference audio files"
 )
 async def upload_reference_audio(files: List[UploadFile] = File(...)):
     """Handles uploading of reference audio files (.wav, .mp3) for voice cloning."""
@@ -900,17 +1157,18 @@ async def upload_reference_audio(files: List[UploadFile] = File(...)):
         "audio/wav",
         "audio/mpeg",
         "audio/x-wav",
-    ]  # Common WAV/MP3 types
+        "audio/mp3",
+        "audio/wave",
+        "audio/x-pn-wav",
+    ]
     allowed_extensions = [".wav", ".mp3"]
 
     for file in files:
         try:
-            # Basic validation
             if not file.filename:
                 errors.append("Received file with no filename.")
                 continue
 
-            # Sanitize filename
             safe_filename = sanitize_filename(file.filename)
             _, ext = os.path.splitext(safe_filename)
             if ext.lower() not in allowed_extensions:
@@ -919,32 +1177,25 @@ async def upload_reference_audio(files: List[UploadFile] = File(...)):
                 )
                 continue
 
-            # Check MIME type (more reliable than extension)
             if file.content_type not in allowed_mime_types:
-                errors.append(
-                    f"File '{file.filename}' has unsupported content type '{file.content_type}'. Allowed: {allowed_mime_types}"
+                logger.warning(
+                    f"File '{file.filename}' has unexpected content type '{file.content_type}'. Allowed: {allowed_mime_types}. Proceeding based on extension."
                 )
-                continue
 
-            # Construct full save path
             destination_path = os.path.join(ref_path, safe_filename)
 
-            # Prevent overwriting existing files (optional, could add counter)
             if os.path.exists(destination_path):
-                # Simple approach: skip if exists
                 logger.warning(
                     f"Reference file '{safe_filename}' already exists. Skipping upload."
                 )
-                # Add to list so UI knows it's available, even if not newly uploaded this time
                 if safe_filename not in uploaded_filenames:
-                    uploaded_filenames.append(safe_filename)
+                    uploaded_filenames.append(safe_filename)  # Report as available
                 continue
-                # Alternative: add counter like file_1.wav, file_2.wav
 
-            # Save the file using shutil.copyfileobj for efficiency with large files
             try:
+                file_content = await file.read()
                 with open(destination_path, "wb") as buffer:
-                    shutil.copyfileobj(file.file, buffer)
+                    buffer.write(file_content)
                 logger.info(f"Successfully saved reference file: {destination_path}")
                 uploaded_filenames.append(safe_filename)
             except Exception as save_exc:
@@ -954,7 +1205,6 @@ async def upload_reference_audio(files: List[UploadFile] = File(...)):
                     exc_info=True,
                 )
             finally:
-                # Ensure the UploadFile resource is closed
                 await file.close()
 
         except Exception as e:
@@ -964,23 +1214,17 @@ async def upload_reference_audio(files: List[UploadFile] = File(...)):
             logger.error(
                 f"Unexpected error processing uploaded file: {e}", exc_info=True
             )
-            # Ensure file is closed even if other errors occur
             if file:
                 await file.close()
 
-    # Get the updated list of all valid files in the directory
     updated_file_list = get_valid_reference_files()
-
     response_data = {
         "message": f"Processed {len(files)} file(s).",
-        "uploaded_files": uploaded_filenames,  # List of successfully saved *new* files this request
-        "all_reference_files": updated_file_list,  # Complete current list
+        "uploaded_files": uploaded_filenames,
+        "all_reference_files": updated_file_list,
         "errors": errors,
     }
-
-    status_code = (
-        200 if not errors or len(errors) < len(files) else 400
-    )  # OK if at least one succeeded, else Bad Request
+    status_code = 200 if not errors or len(errors) < len(files) else 400
     if errors:
         logger.warning(f"Upload completed with errors: {errors}")
 
@@ -991,12 +1235,9 @@ async def upload_reference_audio(files: List[UploadFile] = File(...)):
 @app.get("/health", tags=["Server Status"], summary="Check server health")
 async def health_check():
     """Basic health check, indicates if the server is running and if the model is loaded."""
-    # Access the MODEL_LOADED variable *directly* from the engine module
-    # each time the endpoint is called to get the current status.
-    current_model_status = getattr(engine, "MODEL_LOADED", False)  # Safely get status
-    logger.debug(
-        f"Health check returning model_loaded status: {current_model_status}"
-    )  # Add debug log
+    startup_complete_event.wait(timeout=0.5)
+    current_model_status = getattr(engine, "MODEL_LOADED", False)
+    logger.debug(f"Health check returning model_loaded status: {current_model_status}")
     return {"status": "healthy", "model_loaded": current_model_status}
 
 
@@ -1005,13 +1246,25 @@ if __name__ == "__main__":
     host = get_host()
     port = get_port()
     logger.info(f"Starting Dia TTS server on {host}:{port}")
+    logger.info(
+        f"Configuration will be read from/written to: {os.path.abspath(CONFIG_FILE_PATH)}"
+    )
+    if not os.path.exists(CONFIG_FILE_PATH) and ENV_FILE_PATH:
+        logger.info(
+            f"'{CONFIG_FILE_PATH}' not found. Will attempt initial seeding from: {ENV_FILE_PATH}"
+        )
+    elif not os.path.exists(CONFIG_FILE_PATH):
+        logger.info(f"'{CONFIG_FILE_PATH}' not found. Will create using defaults.")
+
+    # Log key settings read from config
     logger.info(f"Model Repository: {get_model_repo_id()}")
-    logger.info(f"Model Config File: {get_model_config_filename()}")
     logger.info(f"Model Weights File: {get_model_weights_filename()}")
     logger.info(f"Model Cache Path: {get_model_cache_path()}")
     logger.info(f"Reference Audio Path: {get_reference_audio_path()}")
+    logger.info(f"Predefined Voices Path: {get_predefined_voices_path()}")
     logger.info(f"Output Path: {get_output_path()}")
-    # Determine the host to display in logs and use for browser opening
+    logger.info(f"Whisper Model: {get_whisper_model_name()}")
+
     display_host = "localhost" if host == "0.0.0.0" else host
     logger.info(f"Web UI will be available at http://{display_host}:{port}/")
     logger.info(f"API Docs available at http://{display_host}:{port}/docs")
@@ -1023,39 +1276,22 @@ if __name__ == "__main__":
         logger.warning(
             f"'{ui_dir}' directory or '{index_file}' not found. Web UI may not work."
         )
-        # Optionally create dummy files/dirs if needed for startup
         os.makedirs(ui_dir, exist_ok=True)
         if not os.path.isfile(index_file):
             try:
                 with open(index_file, "w") as f:
-                    f.write(
-                        "<html><body>Web UI template missing. See project source for index.html.</body></html>"
-                    )
+                    f.write("<html><body>Web UI template missing.</body></html>")
                 logger.info(f"Created dummy {index_file}.")
             except Exception as e:
                 logger.error(f"Failed to create dummy {index_file}: {e}")
 
-    # --- Create synchronization event ---
-    # This event will be set by the lifespan manager once startup (incl. model loading) is complete.
-    startup_complete_event = threading.Event()
-
     # Run Uvicorn server
-    # The lifespan context manager ('lifespan="on"') will run during startup.
-    # The 'lifespan' function is responsible for loading models and setting the 'startup_complete_event'.
     uvicorn.run(
-        "server:app",  # Use the format 'module:app_instance'
+        "server:app",
         host=host,
         port=port,
-        reload=False,  # Set reload as needed for development/production
-        # reload_dirs=[".", "ui"], # Only use reload=True with reload_dirs/includes for development
-        # reload_includes=[
-        #     "*.py",
-        #     "*.html",
-        #     "*.css",
-        #     "*.js",
-        #     ".env",
-        #     "*.yaml",
-        # ],
-        lifespan="on",  # Use the lifespan context manager defined in this file
-        # workers=1 # Keep workers=1 when using reload=True or complex global state/models
+        reload=False,  # Keep reload=False for production/stability
+        lifespan="on",
+        log_level="info",
+        workers=1,  # Essential for stable in-memory config and model state
     )

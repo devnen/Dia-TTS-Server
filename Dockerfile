@@ -27,7 +27,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create required directories
-RUN mkdir -p model_cache reference_audio outputs
+RUN mkdir -p model_cache reference_audio outputs voices
 
 # Expose the port the application will run on (default to 8003 as per config)
 EXPOSE 8003

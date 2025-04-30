@@ -24,9 +24,14 @@ class OpenAITTSRequest(BaseModel):
     )
     speed: float = Field(
         default=1.0,
-        ge=0.8,
-        le=1.2,  # Dia speed factor range seems narrower
-        description="Adjusts the speed of the generated audio (0.8 to 1.2).",
+        ge=0.5,  # Allow wider range for speed factor post-processing
+        le=2.0,
+        description="Adjusts the speed of the generated audio (0.5 to 2.0).",
+    )
+    # Add seed parameter, defaulting to random (-1)
+    seed: Optional[int] = Field(
+        default=-1,
+        description="Generation seed. Use -1 for random (default), or a specific integer for deterministic output.",
     )
 
 
@@ -44,6 +49,11 @@ class CustomTTSRequest(BaseModel):
         default=None,
         description="Filename of the reference audio within the configured reference path (required if voice_mode is 'clone').",
     )
+    # New: Optional transcript for cloning
+    transcript: Optional[str] = Field(
+        default=None,
+        description="Optional transcript of the reference audio for cloning. If provided, overrides local .txt file lookup and Whisper generation.",
+    )
     output_format: Literal["opus", "wav"] = Field(
         default="opus", description="The desired audio output format."
     )
@@ -51,7 +61,7 @@ class CustomTTSRequest(BaseModel):
     max_tokens: Optional[int] = Field(
         default=None,
         gt=0,
-        description="Maximum number of audio tokens to generate (defaults to model's internal config value).",
+        description="Maximum number of audio tokens to generate per chunk (defaults to model's internal config value).",
     )
     cfg_scale: float = Field(
         default=3.0,
@@ -60,22 +70,44 @@ class CustomTTSRequest(BaseModel):
         description="Classifier-Free Guidance scale (1.0-5.0).",
     )
     temperature: float = Field(
-        default=1.3, ge=1.0, le=1.5, description="Sampling temperature (1.0-1.5)."
+        default=1.3,
+        ge=0.1,
+        le=1.5,
+        description="Sampling temperature (0.1-1.5).",  # Allow lower temp for greedy-like
     )
     top_p: float = Field(
         default=0.95,
-        ge=0.8,
+        ge=0.1,  # Allow lower top_p
         le=1.0,
-        description="Nucleus sampling probability (0.8-1.0).",
+        description="Nucleus sampling probability (0.1-1.0).",
     )
     speed_factor: float = Field(
         default=0.94,
-        ge=0.8,
-        le=1.0,  # Dia's default range seems to be <= 1.0
-        description="Adjusts the speed of the generated audio (0.8 to 1.0).",
+        ge=0.5,  # Allow wider range for speed factor post-processing
+        le=2.0,
+        description="Adjusts the speed of the generated audio (0.5 to 2.0).",
     )
     cfg_filter_top_k: int = Field(
-        default=35, ge=15, le=50, description="Top k filter for CFG guidance (15-50)."
+        default=35,
+        ge=1,
+        le=100,
+        description="Top k filter for CFG guidance (1-100).",  # Allow wider range
+    )
+    # Add seed parameter, defaulting to random (-1)
+    seed: Optional[int] = Field(
+        default=-1,
+        description="Generation seed. Use -1 for random (default), or a specific integer for deterministic output.",
+    )
+    # Add text splitting parameters
+    split_text: Optional[bool] = Field(
+        default=True,  # Default to splitting enabled
+        description="Whether to automatically split long text into chunks for processing.",
+    )
+    chunk_size: Optional[int] = Field(
+        default=300,  # Default target chunk size
+        ge=100,  # Minimum reasonable chunk size
+        le=1000,  # Maximum reasonable chunk size
+        description="Approximate target character length for text chunks when splitting is enabled (100-1000).",
     )
 
 

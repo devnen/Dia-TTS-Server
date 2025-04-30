@@ -33,14 +33,20 @@ class DataConfig(BaseModel, frozen=True):
         delay_pattern: List of delay values for each audio channel.
     """
 
-    text_length: Annotated[int, BeforeValidator(lambda x: (x + 127) // 128 * 128)] = Field(gt=0, multiple_of=128)
-    audio_length: Annotated[int, BeforeValidator(lambda x: (x + 127) // 128 * 128)] = Field(gt=0, multiple_of=128)
+    text_length: Annotated[int, BeforeValidator(lambda x: (x + 127) // 128 * 128)] = (
+        Field(gt=0, multiple_of=128)
+    )
+    audio_length: Annotated[int, BeforeValidator(lambda x: (x + 127) // 128 * 128)] = (
+        Field(gt=0, multiple_of=128)
+    )
     channels: int = Field(default=9, gt=0, multiple_of=1)
     text_pad_value: int = Field(default=0)
     audio_eos_value: int = Field(default=1024)
     audio_pad_value: int = Field(default=1025)
     audio_bos_value: int = Field(default=1026)
-    delay_pattern: list[Annotated[int, Field(ge=0)]] = Field(default_factory=lambda: [0, 8, 9, 10, 11, 12, 13, 14, 15])
+    delay_pattern: list[Annotated[int, Field(ge=0)]] = Field(
+        default_factory=lambda: [0, 8, 9, 10, 11, 12, 13, 14, 15]
+    )
 
     def __hash__(self) -> int:
         """Generate a hash based on all fields of the config."""
@@ -67,8 +73,6 @@ class EncoderConfig(BaseModel, frozen=True):
         n_hidden: Hidden dimension size in the MLP layers.
         n_head: Number of attention heads.
         head_dim: Dimension per attention head.
-        mlp_activations: List of activation functions for the MLP layers.
-        use_pre_norm: Whether to use pre-normalization (LayerNorm before attention/MLP).
     """
 
     n_layer: int = Field(gt=0)
@@ -76,8 +80,6 @@ class EncoderConfig(BaseModel, frozen=True):
     n_hidden: int = Field(gt=0)
     n_head: int = Field(gt=0)
     head_dim: int = Field(gt=0)
-    mlp_activations: list[str] = Field(default=["silu", "linear"])
-    use_pre_norm: bool = Field(default=False)
 
 
 class DecoderConfig(BaseModel, frozen=True):
@@ -92,8 +94,6 @@ class DecoderConfig(BaseModel, frozen=True):
         gqa_head_dim: Dimension per query head for grouped-query self-attention.
         cross_query_heads: Number of query heads for cross-attention.
         cross_head_dim: Dimension per cross-attention head.
-        mlp_activations: List of activation functions for the MLP layers.
-        use_pre_norm: Whether to use pre-normalization.
     """
 
     n_layer: int = Field(gt=0)
@@ -104,8 +104,6 @@ class DecoderConfig(BaseModel, frozen=True):
     gqa_head_dim: int = Field(gt=0)
     cross_query_heads: int = Field(gt=0)
     cross_head_dim: int = Field(gt=0)
-    mlp_activations: list[str] = Field(default=["silu", "linear"])
-    use_pre_norm: bool = Field(default=False)
 
 
 class ModelConfig(BaseModel, frozen=True):
@@ -130,24 +128,16 @@ class ModelConfig(BaseModel, frozen=True):
     dropout: float = Field(default=0.0, ge=0.0, lt=1.0)
     normalization_layer_epsilon: float = Field(default=1.0e-5, ge=0.0)
     weight_dtype: str = Field(default="float32", description="Weight precision")
-    rope_min_timescale: int = Field(default=1, description="Timescale For global Attention")
-    rope_max_timescale: int = Field(default=10_000, description="Timescale For global Attention")
+    rope_min_timescale: int = Field(
+        default=1, description="Timescale For global Attention"
+    )
+    rope_max_timescale: int = Field(
+        default=10_000, description="Timescale For global Attention"
+    )
 
 
 class TrainingConfig(BaseModel, frozen=True):
-    """Training process configuration and hyperparameters.
-
-    Note: This configuration currently only includes precision settings.
-    Other training parameters (like batch size, learning rate, optimizer settings)
-    are assumed to be handled externally.
-
-    Attributes:
-        dtype: Data type for activations during training (e.g., "bfloat16", "float32").
-        logits_dot_in_fp32: Whether to compute the final logits dot product in fp32 for stability.
-    """
-
-    dtype: str = Field(default="bfloat16", description="Activation precision")
-    logits_dot_in_fp32: bool = Field(default=False)
+    pass
 
 
 class DiaConfig(BaseModel, frozen=True):
@@ -164,7 +154,8 @@ class DiaConfig(BaseModel, frozen=True):
 
     version: str = Field(default="1.0")
     model: ModelConfig
-    training: TrainingConfig
+    # TODO: remove training. this is just for backward compatibility
+    training: TrainingConfig | None = Field(default=None)
     data: DataConfig
 
     def save(self, path: str) -> None:
