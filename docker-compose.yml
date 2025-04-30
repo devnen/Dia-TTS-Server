@@ -3,10 +3,10 @@ volumes:
 
 services:
   dia-tts-server:
-    # image: nextboss/dia-tts-server
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: nextboss/dia-tts-server
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
     ports:
       - "${PORT:-8003}:${PORT:-8003}"
     volumes:
