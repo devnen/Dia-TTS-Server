@@ -374,7 +374,7 @@
                             <div id="predefined-voice-options" class="mb-6 hidden">
                                 <label for="predefined_voice_select" class="label-base">Select Predefined Voice (use
                                     voice pairs for dialogues):</label>
-                                <select id="predefined_voice_select" name="predefined_voice_select" class="select-base">
+                                <select id="predefined_voice_select" name="predefined_voice_select" class="select-base" style="max-width: 320px;">
                                     <option value="none">-- Select Voice --</option>
                                     {% for voice in predefined_voices %}
                                     <option value="{{ voice.filename }}" {% if

@@ -413,8 +413,7 @@ document.addEventListener('DOMContentLoaded', function () {
         for (const [selector, info] of Object.entries(modelRegistry)) {
             const option = document.createElement('option');
             option.value = selector;
-            option.textContent = info.display_name + (info.available === false ? ' (not installed)' : '');
-            option.disabled = info.available === false;
+            option.textContent = info.display_name;
             modelSelect.appendChild(option);
         }
     }

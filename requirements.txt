@@ -12,6 +12,7 @@ soundfile # Requires libsndfile system library (e.g., sudo apt-get install libsn
 huggingface_hub
 descript-audio-codec
 safetensors
+torchcodec
 openai-whisper
 
 # Configuration & Utilities

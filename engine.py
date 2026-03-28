@@ -227,14 +227,14 @@ def get_model_info() -> Dict[str, Any]:
 
 
 def get_model_registry() -> Dict[str, Dict[str, Any]]:
-    """Returns the full model registry for the UI dropdown, filtered by availability."""
+    """Returns the full model registry for the UI dropdown. All models are always selectable."""
     result = {}
     for k, v in MODEL_REGISTRY.items():
-        available = True
+        installed = True
         if v["model_type"] == "dia1" and not DIA1_AVAILABLE:
-            available = False
+            installed = False
         if v["model_type"] == "dia2" and not DIA2_AVAILABLE:
-            available = False
+            installed = False
         result[k] = {
             "display_name": v["display_name"],
             "params": v["params"],
@@ -243,7 +243,8 @@ def get_model_registry() -> Dict[str, Dict[str, Any]]:
             "default_voice": v["default_voice"],
             "supports_cloning": v["supports_cloning"],
             "cloning_method": v["cloning_method"],
-            "available": available,
+            "available": True,  # Always selectable — will download/install on demand
+            "installed": installed,
         }
     return result
 
@@ -380,6 +381,38 @@ def get_compute_dtype(device: torch.device, weights_filename: str) -> str:
         return ComputeDtype.FLOAT32.value  # Return string value "float32"
 
 
+def _auto_install_dia2():
+    """Attempts to install the dia2 package via pip at runtime."""
+    global DIA2_AVAILABLE, Dia2, GenerationConfig, SamplingConfig, PrefixConfig, GenerationResult
+    import subprocess
+    import sys
+
+    try:
+        _check_cancelled()
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "dia2"],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"pip install dia2 failed:\n{result.stderr}")
+
+        logger.info("dia2 package installed successfully. Importing...")
+        from dia2 import Dia2 as _Dia2, GenerationConfig as _GC, SamplingConfig as _SC, PrefixConfig as _PC, GenerationResult as _GR
+        Dia2 = _Dia2
+        GenerationConfig = _GC
+        SamplingConfig = _SC
+        PrefixConfig = _PC
+        GenerationResult = _GR
+        DIA2_AVAILABLE = True
+        logger.info("dia2 package imported successfully after auto-install.")
+    except Exception as e:
+        logger.error(f"Failed to auto-install dia2: {e}", exc_info=True)
+        raise ImportError(
+            f"dia2 package could not be installed automatically: {e}. "
+            "Please install it manually: pip install dia2"
+        )
+
+
 def load_model():
     """
     Loads a TTS model based on the current config selector.
@@ -402,11 +435,17 @@ def load_model():
         model_type = reg["model_type"]
         repo_id = reg["repo_id"]
 
-        # Check availability
+        # Check availability — auto-install if missing
         if model_type == "dia1" and not DIA1_AVAILABLE:
-            raise ImportError("Dia 1 (dia) package is not installed. Cannot load Dia 1.6B model.")
+            raise ImportError(
+                "Dia 1 (dia) package is not installed. "
+                "The local 'dia/' directory with model code is required. "
+                "Please check that the repository was cloned completely."
+            )
         if model_type == "dia2" and not DIA2_AVAILABLE:
-            raise ImportError("Dia 2 (dia2) package is not installed. Cannot load Dia 2 models.")
+            logger.info("dia2 package not found. Attempting to install it automatically...")
+            _update_download_status("installing", "Installing dia2 package (pip install dia2)...", 5)
+            _auto_install_dia2()
 
         cache_path = get_model_cache_path()
         model_device = get_device()
