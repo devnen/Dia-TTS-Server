@@ -411,9 +411,23 @@ class Dia:
         return result
 
     def load_audio(self, audio_path: str) -> torch.Tensor:
-        audio, sr = torchaudio.load(audio_path, channels_first=True)  # C, T
+        # Use soundfile instead of torchaudio.load to avoid FFmpeg/torchcodec dependency
+        import soundfile as sf
+        import numpy as np
+        audio_np, sr = sf.read(audio_path, dtype='float32')
+        if audio_np.ndim == 1:
+            audio_np = audio_np[np.newaxis, :]  # [1, T] mono
+        else:
+            audio_np = audio_np.T  # [C, T] channels first
+        audio = torch.from_numpy(audio_np)
         if sr != DEFAULT_SAMPLE_RATE:
-            audio = torchaudio.functional.resample(audio, sr, DEFAULT_SAMPLE_RATE)
+            import librosa
+            resampled = []
+            for ch in range(audio.shape[0]):
+                resampled.append(torch.from_numpy(
+                    librosa.resample(audio[ch].numpy(), orig_sr=sr, target_sr=DEFAULT_SAMPLE_RATE)
+                ))
+            audio = torch.stack(resampled)
         audio = audio.to(self.device).unsqueeze(0)  # 1, C, T
         audio_data = self.dac_model.preprocess(audio, DEFAULT_SAMPLE_RATE)
         _, encoded_frame, _, _, _ = self.dac_model.encode(audio_data)  # 1, C, T
