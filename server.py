@@ -221,6 +221,20 @@ except RuntimeError as e:
 templates = Jinja2Templates(directory="ui")
 
 
+def _render_template(request, name, context, status_code=200):
+    """Version-agnostic TemplateResponse wrapper for Starlette 0.x and 1.x."""
+    import starlette
+    major = int(starlette.__version__.split(".")[0])
+    if major >= 1:
+        # Starlette 1.0+: request is a separate positional arg
+        return templates.TemplateResponse(request, name, context=context, status_code=status_code)
+    else:
+        # Starlette 0.x: request goes inside the context dict
+        ctx = dict(context) if context else {}
+        ctx["request"] = request
+        return templates.TemplateResponse(name, ctx, status_code=status_code)
+
+
 # --- Configuration Routes (New YAML-based) ---
 @app.post(
     "/save_settings",
@@ -831,7 +845,7 @@ async def get_web_ui(request: Request):
             "success": None,
         }
 
-        return templates.TemplateResponse(request, "index.html", context=template_context)
+        return _render_template(request, "index.html", template_context)
 
     except Exception as e:
         logger.error(f"Error rendering Web UI: {e}", exc_info=True)
@@ -909,7 +923,7 @@ async def handle_web_ui_generate(
             "output_file_url": None,
             "generation_time": None,
         }
-        return templates.TemplateResponse(request, "index.html", context=error_context, status_code=503)
+        return _render_template(request, "index.html", error_context, status_code=503)
 
     # --- Start processing the valid request ---
     logger.info(
@@ -1052,9 +1066,7 @@ async def handle_web_ui_generate(
             "output_file_url": None,
             "generation_time": None,
         }
-        return templates.TemplateResponse(
-            request, "index.html", context=error_context, status_code=400
-        )  # Bad Request
+        return _render_template(request, "index.html", error_context, status_code=400)
 
     # --- Generation ---
     try:
@@ -1218,12 +1230,7 @@ async def handle_web_ui_generate(
     }
 
     # Render and return the HTML response
-    return templates.TemplateResponse(
-        request,
-        "index.html",
-        context=template_context,
-        status_code=status_code,
-    )
+    return _render_template(request, "index.html", template_context, status_code=status_code)
 
 
 # --- Reference Audio Upload Endpoint ---

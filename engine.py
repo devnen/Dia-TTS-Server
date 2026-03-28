@@ -382,19 +382,51 @@ def get_compute_dtype(device: torch.device, weights_filename: str) -> str:
 
 
 def _auto_install_dia2():
-    """Attempts to install the dia2 package via pip at runtime."""
+    """
+    Attempts to install the dia2 package from GitHub at runtime.
+    dia2 is NOT on PyPI — must be cloned and installed in editable mode
+    because the pyproject.toml has a packaging bug (missing subpackages).
+    """
     global DIA2_AVAILABLE, Dia2, GenerationConfig, SamplingConfig, PrefixConfig, GenerationResult
     import subprocess
     import sys
 
+    DIA2_REPO_URL = "https://github.com/nari-labs/dia2.git"
+    dia2_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dia2_src")
+
     try:
         _check_cancelled()
+
+        # Step 1: Clone the dia2 repo if not already present
+        if not os.path.isdir(dia2_src_dir):
+            logger.info(f"Cloning dia2 repository from {DIA2_REPO_URL}...")
+            _update_download_status("downloading", "Cloning dia2 repository from GitHub...", 10)
+            result = subprocess.run(
+                ["git", "clone", DIA2_REPO_URL, dia2_src_dir],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"git clone failed:\n{result.stderr}")
+            logger.info("dia2 repository cloned successfully.")
+        else:
+            logger.info(f"dia2 source already exists at {dia2_src_dir}, pulling latest...")
+            _update_download_status("downloading", "Updating dia2 repository...", 10)
+            subprocess.run(
+                ["git", "-C", dia2_src_dir, "pull", "--ff-only"],
+                capture_output=True, text=True, timeout=60,
+            )
+
+        _check_cancelled()
+
+        # Step 2: Install in editable mode with --no-deps to avoid breaking other packages
+        logger.info("Installing dia2 package (editable mode, no-deps)...")
+        _update_download_status("installing", "Installing dia2 package...", 25)
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "dia2"],
-            capture_output=True, text=True, timeout=600,
+            [sys.executable, "-m", "pip", "install", "-e", dia2_src_dir, "--no-deps"],
+            capture_output=True, text=True, timeout=300,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"pip install dia2 failed:\n{result.stderr}")
+            raise RuntimeError(f"pip install -e dia2 failed:\n{result.stderr}")
 
         logger.info("dia2 package installed successfully. Importing...")
         from dia2 import Dia2 as _Dia2, GenerationConfig as _GC, SamplingConfig as _SC, PrefixConfig as _PC, GenerationResult as _GR
@@ -409,7 +441,7 @@ def _auto_install_dia2():
         logger.error(f"Failed to auto-install dia2: {e}", exc_info=True)
         raise ImportError(
             f"dia2 package could not be installed automatically: {e}. "
-            "Please install it manually: pip install dia2"
+            "Please install manually: git clone https://github.com/nari-labs/dia2.git dia2_src && pip install -e dia2_src --no-deps"
         )
 
 

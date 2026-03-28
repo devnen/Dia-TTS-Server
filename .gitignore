@@ -36,6 +36,7 @@ env/
 outputs/
 reference_audio/
 model_cache/ # Also good practice to ignore the model cache
+dia2_src/ # Auto-cloned dia2 source (installed via editable pip)
 
 # Ignore test reports/coverage
 .coverage
