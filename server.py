@@ -831,7 +831,7 @@ async def get_web_ui(request: Request):
             "success": None,
         }
 
-        return templates.TemplateResponse("index.html", template_context)
+        return templates.TemplateResponse(request, "index.html", context=template_context)
 
     except Exception as e:
         logger.error(f"Error rendering Web UI: {e}", exc_info=True)
@@ -909,7 +909,7 @@ async def handle_web_ui_generate(
             "output_file_url": None,
             "generation_time": None,
         }
-        return templates.TemplateResponse("index.html", error_context, status_code=503)
+        return templates.TemplateResponse(request, "index.html", context=error_context, status_code=503)
 
     # --- Start processing the valid request ---
     logger.info(
@@ -1053,7 +1053,7 @@ async def handle_web_ui_generate(
             "generation_time": None,
         }
         return templates.TemplateResponse(
-            "index.html", error_context, status_code=400
+            request, "index.html", context=error_context, status_code=400
         )  # Bad Request
 
     # --- Generation ---
@@ -1219,9 +1219,10 @@ async def handle_web_ui_generate(
 
     # Render and return the HTML response
     return templates.TemplateResponse(
+        request,
         "index.html",
-        template_context,  # Pass the complete context dictionary
-        status_code=status_code,  # Set appropriate HTTP status
+        context=template_context,
+        status_code=status_code,
     )
 
 
