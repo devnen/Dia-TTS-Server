@@ -142,6 +142,15 @@
             .dark .theme-switch-thumb { @apply bg-indigo-500 translate-x-6; }
         }
 
+        /* Status dot indicators for model selector */
+        .status-dot-green, .status-dot-red, .status-dot-yellow, .status-dot-neutral {
+            display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+        }
+        .status-dot-green { background-color: #22c55e; }
+        .status-dot-red { background-color: #ef4444; }
+        .status-dot-yellow { background-color: #eab308; }
+        .status-dot-neutral { background-color: #94a3b8; }
+
         /* Specific slider thumb styling */
         input[type="range"].slider-base::-webkit-slider-thumb { @apply slider-thumb; }
         input[type="range"].slider-base::-moz-range-thumb { @apply slider-thumb; }
@@ -230,6 +239,31 @@
                         <span class="block sm:inline">{{ success }}</span>
                     </div>
                     {% endif %}
+                </div>
+
+                <!-- Model Selection Section (above the main card) -->
+                <div id="model-selection-section" class="card-base mb-4" style="padding: 0.75rem 1.25rem;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <label for="model-select" class="label-base" style="white-space: nowrap; margin: 0; font-size: 0.8125rem;">Active Model:</label>
+                        <select id="model-select" name="model_selector" class="select-base" style="width: auto; max-width: 320px; min-width: 180px; padding-top: 0.3rem; padding-bottom: 0.3rem; font-size: 0.8125rem;">
+                            <option value="">Loading models...</option>
+                        </select>
+                        <div id="model-status" style="display: flex; align-items: center; gap: 6px; white-space: nowrap; margin-left: auto;">
+                            <span id="model-status-indicator" class="status-dot-neutral"></span>
+                            <span id="model-status-text" style="font-size: 0.75rem; color: #94a3b8;">Checking model...</span>
+                        </div>
+                    </div>
+                    <div id="model-action-row" class="hidden" style="margin-top: 0.5rem; display: none;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span id="model-pending-text" style="font-size: 0.75rem; color: #ca8a04;">Model change pending</span>
+                            <button id="apply-model-btn" type="button" class="btn-secondary" style="display: inline-flex; align-items: center; white-space: nowrap; gap: 5px; font-size: 0.75rem; padding: 0.25rem 0.65rem; line-height: 1.4;">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" style="width: 14px; height: 14px; flex-shrink: 0;">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" />
+                                </svg>
+                                <span>Apply &amp; Restart</span>
+                            </button>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- TTS form -->
@@ -864,6 +898,26 @@
     </script>
 
     <!-- Link External JavaScript -->
+    <!-- Model Switch Progress Modal -->
+    <div id="model-switch-modal" class="loading-overlay-base hidden opacity-0" data-state="closed" style="display: none;">
+        <div class="loading-box-base" style="max-width: 420px;">
+            <svg class="loading-spinner animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none"
+                viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor"
+                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
+                </path>
+            </svg>
+            <p id="model-switch-title" class="loading-text font-semibold">Switching Model...</p>
+            <p id="model-switch-phase" class="text-sm text-slate-600 dark:text-slate-400 mt-1">Preparing...</p>
+            <p id="model-switch-detail" class="text-xs text-slate-500 dark:text-slate-400 mt-1">Please wait while the model is downloaded and loaded.</p>
+            <div class="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2.5 mt-3">
+                <div id="model-switch-progress" class="bg-indigo-600 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+            </div>
+            <p id="model-switch-pct" class="text-xs text-slate-500 dark:text-slate-400 mt-1 tabular-nums">0%</p>
+        </div>
+    </div>
+
     <script src="/ui/script.js" defer></script>
 </body>
 

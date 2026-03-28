@@ -1,8 +1,8 @@
-# Dia TTS Server: OpenAI-Compatible API with Web UI, Large Text Handling & Built-in Voices
+# Dia TTS Server: Multi-Model Support (Dia 1.6B + Dia 2), OpenAI-Compatible API, Web UI & Built-in Voices
 
-**Self-host the powerful [Nari Labs Dia TTS model](https://github.com/nari-labs/dia) with this enhanced FastAPI server! Features an intuitive Web UI, flexible API endpoints (including OpenAI-compatible `/v1/audio/speech`), support for realistic dialogue (`[S1]`/`[S2]`), improved voice cloning, large text processing via intelligent chunking, and consistent, reproducible voices using 43 built-in ready-to-use voices and generation seeds feature.**
+**Self-host the powerful [Nari Labs Dia TTS models](https://github.com/nari-labs/dia) — including the original **Dia 1.6B** and the new **Dia 2** family (1B & 2B) — with this enhanced FastAPI server! Features hot-swappable model switching, an intuitive Web UI, flexible API endpoints (including OpenAI-compatible `/v1/audio/speech`), support for realistic dialogue (`[S1]`/`[S2]`), improved voice cloning, large text processing via intelligent chunking, and consistent, reproducible voices using 43 built-in ready-to-use voices and generation seeds feature.**
 
-The latest Dia-TTS-Server version now has improved speed and reduced VRAM usage. Defaults to efficient BF16 SafeTensors for reduced VRAM and faster inference, with support for original `.pth` weights. Runs accelerated on NVIDIA GPUs (CUDA) with CPU fallback.
+The latest Dia-TTS-Server version adds multi-model support with the Dia 2 family. Switch between Dia 1.6B, Dia2-1B, and Dia2-2B directly from the Web UI. Defaults to efficient BF16 for reduced VRAM and faster inference. Runs accelerated on NVIDIA GPUs (CUDA) with CPU fallback.
 
 ➡️ **Announcing our new TTS project:** Explore the Chatterbox TTS Server and its features: [https://github.com/devnen/Chatterbox-TTS-Server](https://github.com/devnen/Chatterbox-TTS-Server)
 
@@ -24,7 +24,7 @@ The latest Dia-TTS-Server version now has improved speed and reduced VRAM usage.
 
 ## 🗣️ Overview: Enhanced Dia TTS Access
 
-The original [Dia 1.6B TTS model by Nari Labs](https://github.com/nari-labs/dia) provides incredible capabilities for generating realistic dialogue, complete with speaker turns and non-verbal sounds like `(laughs)` or `(sighs)`. This project builds upon that foundation by providing a robust **[FastAPI](https://fastapi.tiangolo.com/) server** that makes Dia significantly easier to use and integrate.
+The [Dia TTS models by Nari Labs](https://github.com/nari-labs/dia) — including the original **Dia 1.6B** and the new **Dia 2** family (1B & 2B) — provide incredible capabilities for generating realistic dialogue, complete with speaker turns and non-verbal sounds like `(laughs)` or `(sighs)`. This project builds upon that foundation by providing a robust **[FastAPI](https://fastapi.tiangolo.com/) server** with hot-swappable multi-model support that makes Dia significantly easier to use and integrate.
 
 We solve the complexity of setting up and running the model by offering:
 
@@ -41,9 +41,26 @@ We solve the complexity of setting up and running the model by offering:
 
 This server is your gateway to leveraging Dia's advanced TTS capabilities seamlessly, now with enhanced stability, voice consistency, and large text support.
 
-## ✨ What's New (v1.4.0 vs v1.0.0)
+## 🆕 What's New
 
-This version introduces significant improvements and new features:
+### 🔁 Dia 2 Multi-Model Support (v2.0.0)
+
+- **Dia 2 Model Support:** Added full support for Nari Labs' **Dia 2** family — both **Dia2-1B** (streaming, ~1B params) and **Dia2-2B** (high quality, ~2B params) — alongside the original Dia 1.6B model.
+- **Hot-Swappable Model Switching:** Switch between all three models directly from the Web UI without restarting the server. The new model selector dropdown sits above the main generation card with real-time status indicators.
+- **Background Model Loading:** Model downloads and loading happen in a background thread — the server stays responsive while switching models. A progress modal shows download/loading phases in real-time.
+- **Per-Speaker Voice Conditioning (Dia 2):** Dia 2 uses a modern prefix-speaker conditioning approach instead of Dia 1's `audio_prompt` method, enabling independent voice references for each speaker.
+- **Model Registry Architecture:** All models are defined in a centralized `MODEL_REGISTRY` with metadata (HuggingFace repo IDs, parameter counts, voice modes, cloning methods). The engine automatically resolves both friendly selector names and full repo IDs.
+- **Cancellable Downloads:** Cancel in-progress model downloads via the UI when you change your mind mid-switch.
+- **New API Endpoints:**
+    - `POST /restart_server` — async model hot-swap (returns immediately)
+    - `GET /api/model-info` — current model details
+    - `GET /api/model-registry` — all available models for dropdown
+    - `GET /api/model-status` — download/loading progress (UI polls this)
+    - `POST /api/cancel-loading` — cancel in-progress model load
+    - `POST /api/unload` — unload current model and free resources
+- **Defensive Package Imports:** Dia 1 and Dia 2 packages are imported with `try/except` — if either is not installed, only that model shows as unavailable in the UI. The server still works with whichever package(s) are installed.
+
+### ✨ Previous Release (v1.4.0)
 
 **🚀 New Features:**
 

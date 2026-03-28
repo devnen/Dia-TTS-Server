@@ -1,86 +1,50 @@
 # engine.py
-# Core Dia TTS model loading and generation logic, adapted for new dia library structure
+# Core TTS model loading and speech generation logic.
+# Supports Dia 1.6B (original) and Dia 2 models (1B, 2B) with hot-swappable model switching.
 
+import gc
 import logging
 import time
 import os
+import threading
 import torch
-import torchaudio  # Import torchaudio for loading/processing
+import torchaudio
 import numpy as np
-from typing import Optional, Tuple, List, Dict, Any  # Added Dict, Any
+from typing import Optional, Tuple, List, Dict, Any
 from huggingface_hub import hf_hub_download
-from tqdm import tqdm  # Import tqdm for progress bars
+from tqdm import tqdm
 
-# Import Dia model class and config from the NEW dia library structure
+# --- Defensive Imports: Dia 1 (original) ---
 try:
     from dia.model import (
-        Dia,
+        Dia as Dia1Model,
         ComputeDtype,
-        DEFAULT_SAMPLE_RATE,
-    )  # Use new Dia class and constants
+        DEFAULT_SAMPLE_RATE as DIA1_SAMPLE_RATE,
+    )
     from dia.config import DiaConfig
 
-    # Import state management classes
-    from dia.state import EncoderInferenceState, DecoderInferenceState, DecoderOutput
-except ImportError as e:
-    logging.critical(
-        f"Failed to import NEW Dia model components: {e}. Ensure the updated 'dia' package exists and is importable.",
-        exc_info=True,
-    )
-
-    # Define dummy classes/functions to prevent server crash on import,
-    # but generation will fail later if these are used.
-    class Dia:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        @staticmethod
-        def from_local(*args, **kwargs):
-            raise RuntimeError("Dia model package not available or failed to import.")
-
-        def generate(*args, **kwargs):
-            raise RuntimeError("Dia model package not available or failed to import.")
-
-        def _prepare_text_input(self, *args, **kwargs):
-            raise RuntimeError("Dia model package not available or failed to import.")
-
-        def load_audio(self, *args, **kwargs):
-            raise RuntimeError("Dia model package not available or failed to import.")
-
-        def _prepare_audio_prompt(self, *args, **kwargs):
-            raise RuntimeError("Dia model package not available or failed to import.")
-
-        def _decoder_step(self, *args, **kwargs):
-            raise RuntimeError("Dia model package not available or failed to import.")
-
-        def _generate_output(self, *args, **kwargs):
-            raise RuntimeError("Dia model package not available or failed to import.")
-
-        # Add dummy _load_dac_model if needed by other parts
-        def _load_dac_model(self, *args, **kwargs):
-            raise RuntimeError("Dia model package not available or failed to import.")
-
-    class DiaConfig:
-        pass
-
-    class EncoderInferenceState:
-        @staticmethod
-        def new(*args, **kwargs):
-            pass
-
-    class DecoderInferenceState:
-        @staticmethod
-        def new(*args, **kwargs):
-            pass
-
-    class DecoderOutput:
-        @staticmethod
-        def new(*args, **kwargs):
-            pass
-
+    DIA1_AVAILABLE = True
+except ImportError:
+    Dia1Model = None
     ComputeDtype = None
-    DEFAULT_SAMPLE_RATE = 44100  # Fallback sample rate
+    DiaConfig = None
+    DIA1_SAMPLE_RATE = 44100
+    DIA1_AVAILABLE = False
+    logging.info("Dia 1 (dia) package not available. Dia 1.6B model will be unavailable.")
 
+# --- Defensive Imports: Dia 2 ---
+try:
+    from dia2 import Dia2, GenerationConfig, SamplingConfig, PrefixConfig, GenerationResult
+
+    DIA2_AVAILABLE = True
+except ImportError:
+    Dia2 = None
+    GenerationConfig = None
+    SamplingConfig = None
+    PrefixConfig = None
+    GenerationResult = None
+    DIA2_AVAILABLE = False
+    logging.info("Dia 2 (dia2) package not available. Dia 2 models will be unavailable.")
 
 # Import configuration getters from our project's config.py
 from config import (
@@ -89,8 +53,8 @@ from config import (
     get_reference_audio_path,
     get_model_config_filename,
     get_model_weights_filename,
-    get_gen_default_seed,  # Import seed getter
-    get_whisper_model_name,  # Import Whisper config getter
+    get_gen_default_seed,
+    get_whisper_model_name,
 )
 
 # Import text splitting utility and other helpers
@@ -100,18 +64,188 @@ from utils import (
     trim_lead_trail_silence,
     fix_internal_silence,
     remove_long_unvoiced_segments,
-    _generate_transcript_with_whisper,  # Import Whisper helper
+    _generate_transcript_with_whisper,
 )
 
 logger = logging.getLogger(__name__)
 
-# --- Global Variables ---
-dia_model: Optional[Dia] = None
-model_config_instance: Optional[DiaConfig] = None  # Keep for potential reference
+# --- Model Registry ---
+# Maps friendly selector names to model metadata.
+MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "dia-1.6b": {
+        "repo_id": "ttj/dia-1.6b-safetensors",
+        "display_name": "Dia 1.6B (Original)",
+        "params": "1.6B",
+        "model_type": "dia1",
+        "sample_rate": 44100,
+        "voices": ["dialogue", "single_s1", "single_s2", "clone", "predefined"],
+        "default_voice": "predefined",
+        "supports_cloning": True,
+        "cloning_method": "audio_prompt",
+    },
+    "dia2-1b": {
+        "repo_id": "nari-labs/Dia2-1B",
+        "display_name": "Dia 2 — 1B (Streaming)",
+        "params": "1B",
+        "model_type": "dia2",
+        "sample_rate": None,  # Read from model at runtime
+        "voices": ["dialogue", "single_s1", "single_s2", "clone", "predefined"],
+        "default_voice": "predefined",
+        "supports_cloning": True,
+        "cloning_method": "prefix_speaker",
+    },
+    "dia2-2b": {
+        "repo_id": "nari-labs/Dia2-2B",
+        "display_name": "Dia 2 — 2B (High Quality)",
+        "params": "2B",
+        "model_type": "dia2",
+        "sample_rate": None,  # Read from model at runtime
+        "voices": ["dialogue", "single_s1", "single_s2", "clone", "predefined"],
+        "default_voice": "predefined",
+        "supports_cloning": True,
+        "cloning_method": "prefix_speaker",
+    },
+}
+
+# Build reverse lookup: repo_id -> selector key
+_REPO_TO_SELECTOR: Dict[str, str] = {}
+for _sel, _info in MODEL_REGISTRY.items():
+    _REPO_TO_SELECTOR[_info["repo_id"]] = _sel
+
+
+def resolve_selector(config_value: str) -> str:
+    """
+    Resolves a config model.repo_id value to a registry selector key.
+    Accepts either a selector key directly or a full HuggingFace repo_id.
+    Returns the selector key, or falls back to 'dia-1.6b' if unknown.
+    """
+    if config_value in MODEL_REGISTRY:
+        return config_value
+    if config_value in _REPO_TO_SELECTOR:
+        return _REPO_TO_SELECTOR[config_value]
+    lower = config_value.lower().strip()
+    for sel in MODEL_REGISTRY:
+        if sel.lower() == lower:
+            return sel
+    for repo_id, sel in _REPO_TO_SELECTOR.items():
+        if repo_id.lower() == lower:
+            return sel
+    logger.warning(
+        f"Unknown model selector '{config_value}'. "
+        f"Valid selectors: {list(MODEL_REGISTRY.keys())}. "
+        f"Defaulting to 'dia-1.6b'."
+    )
+    return "dia-1.6b"
+
+
+# --- Global Module Variables ---
+dia_model: Optional[Any] = None  # Dia1Model or Dia2 instance
+model_config_instance: Optional[Any] = None
 model_device: Optional[torch.device] = None
-MODEL_LOADED = False
-# Use sample rate from the imported dia library if available
-EXPECTED_SAMPLE_RATE = DEFAULT_SAMPLE_RATE
+MODEL_LOADED: bool = False
+EXPECTED_SAMPLE_RATE: int = 44100
+
+# Track which model is loaded
+loaded_model_selector: Optional[str] = None
+loaded_model_type: Optional[str] = None  # "dia1" or "dia2"
+
+# --- Async Loading & Cancellation ---
+_load_lock = threading.Lock()
+_cancel_event = threading.Event()
+_load_thread: Optional[threading.Thread] = None
+
+# Download progress tracking for UI status modal
+_download_status: Dict[str, Any] = {
+    "active": False,
+    "phase": "",
+    "detail": "",
+    "progress_pct": 0,
+    "error": None,
+}
+
+
+def _check_cancelled():
+    """Raises RuntimeError if model loading has been cancelled."""
+    if _cancel_event.is_set():
+        raise RuntimeError("Model loading cancelled by user.")
+
+
+def _update_download_status(phase: str, detail: str = "", progress_pct: int = 0, error: str = None):
+    """Update the download status for the UI to poll."""
+    global _download_status
+    _download_status = {
+        "active": error is None and phase != "complete",
+        "phase": phase,
+        "detail": detail,
+        "progress_pct": progress_pct,
+        "error": error,
+    }
+
+
+def get_download_status() -> Dict[str, Any]:
+    """Returns the current download/loading status for UI polling."""
+    return dict(_download_status)
+
+
+def is_loading() -> bool:
+    """Returns True if a model is currently being loaded in the background."""
+    return _load_thread is not None and _load_thread.is_alive()
+
+
+def get_model_info() -> Dict[str, Any]:
+    """Returns information about the currently loaded model."""
+    if loaded_model_selector and loaded_model_selector in MODEL_REGISTRY:
+        reg = MODEL_REGISTRY[loaded_model_selector]
+        return {
+            "loaded": MODEL_LOADED,
+            "selector": loaded_model_selector,
+            "repo_id": reg["repo_id"],
+            "display_name": reg["display_name"],
+            "params": reg["params"],
+            "model_type": reg["model_type"],
+            "sample_rate": EXPECTED_SAMPLE_RATE,
+            "voices": reg["voices"],
+            "default_voice": reg["default_voice"],
+            "supports_cloning": reg["supports_cloning"],
+            "cloning_method": reg["cloning_method"],
+            "device": str(model_device) if model_device else None,
+        }
+    return {
+        "loaded": MODEL_LOADED,
+        "selector": loaded_model_selector,
+        "repo_id": None,
+        "display_name": None,
+        "params": None,
+        "model_type": loaded_model_type,
+        "sample_rate": EXPECTED_SAMPLE_RATE,
+        "voices": [],
+        "default_voice": None,
+        "supports_cloning": False,
+        "cloning_method": None,
+        "device": str(model_device) if model_device else None,
+    }
+
+
+def get_model_registry() -> Dict[str, Dict[str, Any]]:
+    """Returns the full model registry for the UI dropdown, filtered by availability."""
+    result = {}
+    for k, v in MODEL_REGISTRY.items():
+        available = True
+        if v["model_type"] == "dia1" and not DIA1_AVAILABLE:
+            available = False
+        if v["model_type"] == "dia2" and not DIA2_AVAILABLE:
+            available = False
+        result[k] = {
+            "display_name": v["display_name"],
+            "params": v["params"],
+            "model_type": v["model_type"],
+            "voices": v["voices"],
+            "default_voice": v["default_voice"],
+            "supports_cloning": v["supports_cloning"],
+            "cloning_method": v["cloning_method"],
+            "available": available,
+        }
+    return result
 
 # --- Model Loading ---
 
@@ -248,143 +382,307 @@ def get_compute_dtype(device: torch.device, weights_filename: str) -> str:
 
 def load_model():
     """
-    Loads the Dia TTS model and associated DAC model using the new Dia class methods.
-    Downloads model files based on configuration if they don't exist locally.
-    Handles both .pth and .safetensors formats via the underlying Dia class.
+    Loads a TTS model based on the current config selector.
+    Supports both Dia 1 (original) and Dia 2 (1B/2B) models.
+    Downloads model files from HuggingFace if not cached.
     """
     global dia_model, model_config_instance, model_device, MODEL_LOADED, EXPECTED_SAMPLE_RATE
+    global loaded_model_selector, loaded_model_type
 
     if MODEL_LOADED:
-        logger.info("Dia model already loaded.")
+        logger.info("Model already loaded.")
+        _update_download_status("complete", "Model already loaded.", 100)
         return True
 
-    # Get configuration values
-    repo_id = get_model_repo_id()
-    config_filename = get_model_config_filename()
-    weights_filename = get_model_weights_filename()
-    cache_path = get_model_cache_path()
-    model_device = get_device()
-    compute_dtype_str = get_compute_dtype(
-        model_device, weights_filename
-    )  # Determine compute dtype
-
-    logger.info(f"Attempting to load Dia model:")
-    logger.info(f"  Repo ID: {repo_id}")
-    logger.info(f"  Config File: {config_filename}")
-    logger.info(f"  Weights File: {weights_filename}")
-    logger.info(f"  Cache Directory: {cache_path}")
-    logger.info(f"  Target Device: {model_device}")
-    logger.info(f"  Compute Dtype: {compute_dtype_str}")
-
-    # Ensure cache directory exists
     try:
+        # Resolve the model selector from config
+        config_value = get_model_repo_id()
+        selector = resolve_selector(config_value)
+        reg = MODEL_REGISTRY[selector]
+        model_type = reg["model_type"]
+        repo_id = reg["repo_id"]
+
+        # Check availability
+        if model_type == "dia1" and not DIA1_AVAILABLE:
+            raise ImportError("Dia 1 (dia) package is not installed. Cannot load Dia 1.6B model.")
+        if model_type == "dia2" and not DIA2_AVAILABLE:
+            raise ImportError("Dia 2 (dia2) package is not installed. Cannot load Dia 2 models.")
+
+        cache_path = get_model_cache_path()
+        model_device = get_device()
+
+        logger.info(f"Loading model: {reg['display_name']} ({repo_id})")
+        logger.info(f"  Model type: {model_type}")
+        logger.info(f"  Cache directory: {cache_path}")
+        logger.info(f"  Target device: {model_device}")
+
         os.makedirs(cache_path, exist_ok=True)
-    except OSError as e:
-        logger.error(
-            f"Failed to create cache directory '{cache_path}': {e}", exc_info=True
-        )
-        # Allow hf_hub_download to handle potential issues later
-        pass
-
-    try:
         start_time = time.time()
 
-        # --- Download Model Files ---
-        logger.info(
-            f"Downloading/finding configuration file '{config_filename}' from repo '{repo_id}'..."
-        )
-        local_config_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=config_filename,
-            cache_dir=cache_path,
-            # force_download=True # Uncomment to force redownload for testing
-        )
-        logger.info(f"Configuration file path: {local_config_path}")
-
-        logger.info(
-            f"Downloading/finding weights file '{weights_filename}' from repo '{repo_id}'..."
-        )
-        local_weights_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=weights_filename,
-            cache_dir=cache_path,
-            # force_download=True # Uncomment to force redownload for testing
-        )
-        logger.info(f"Weights file path: {local_weights_path}")
-
-        # --- Load Model using the NEW Dia class method ---
-
-        config = DiaConfig.load(local_config_path)
-        if config is None:
-            raise FileNotFoundError(
-                f"Config file failed to load from {local_config_path}"
-            )
-
-        # Instantiate the Dia class
-        dia_instance = Dia(config, compute_dtype=compute_dtype_str, device=model_device)
-
-        # Load weights manually based on file type
-        # Load to CPU first to potentially reduce GPU VRAM spike during loading
-        logger.info(f"Loading weights from: {local_weights_path} to CPU RAM first...")
-        map_location = torch.device("cpu")  # Load to CPU
-        if local_weights_path.endswith(".safetensors"):
-            from safetensors.torch import load_file
-
-            logger.info(
-                "Detected .safetensors format. Loading using safetensors library."
-            )
-            state_dict = load_file(local_weights_path, device=str(map_location))
-        elif local_weights_path.endswith(".pth"):
-            logger.info("Detected .pth format. Loading using torch.load.")
-            state_dict = torch.load(local_weights_path, map_location=map_location)
+        if model_type == "dia1":
+            _load_dia1_model(repo_id, cache_path)
+        elif model_type == "dia2":
+            _load_dia2_model(repo_id, cache_path)
         else:
-            raise ValueError(f"Unsupported weights file format: {weights_filename}")
+            raise ValueError(f"Unknown model type: {model_type}")
 
-        logger.info("Applying loaded weights to the model structure...")
-        dia_instance.model.load_state_dict(state_dict)
-        logger.info("Weights applied successfully.")
-
-        # Move model to target device and set eval mode
-        logger.info(f"Moving model to target device: {model_device}")
-        dia_instance.model.to(model_device)
-        dia_instance.model.eval()
-
-        # Load DAC model (now handled within Dia class constructor or methods)
-        logger.info("Loading associated DAC model...")
-        dia_instance._load_dac_model()  # Call the internal method
-
-        dia_model = dia_instance  # Assign to global variable
-        model_config_instance = dia_model.config  # Store config if needed
-        EXPECTED_SAMPLE_RATE = DEFAULT_SAMPLE_RATE  # Use the constant from dia library
+        loaded_model_selector = selector
+        loaded_model_type = model_type
+        MODEL_LOADED = True
 
         end_time = time.time()
-        logger.info(
-            f"Dia model loaded successfully in {end_time - start_time:.2f} seconds."
-        )
-        MODEL_LOADED = True
+        logger.info(f"Model loaded successfully in {end_time - start_time:.2f} seconds.")
+        _update_download_status("complete", f"{reg['display_name']} loaded successfully.", 100)
         return True
 
-    except FileNotFoundError as e:
-        logger.error(
-            f"Model loading failed: Required file not found. {e}", exc_info=True
-        )
+    except RuntimeError as e:
+        if "cancelled" in str(e).lower():
+            logger.info(f"Model loading cancelled: {e}")
+            _update_download_status("cancelled", "Model loading was cancelled.", 0)
+        else:
+            logger.error(f"Model loading error: {e}", exc_info=True)
+            _update_download_status("error", "", 0, str(e))
         MODEL_LOADED = False
         return False
-    except ImportError:
-        logger.critical(
-            "Failed to load model: Dia package or its core dependencies not found.",
-            exc_info=True,
-        )
+    except ImportError as e:
+        logger.critical(f"Missing package: {e}", exc_info=True)
+        _update_download_status("error", "", 0, str(e))
         MODEL_LOADED = False
         return False
     except Exception as e:
-        logger.error(
-            f"Error loading Dia model from repo '{repo_id}': {e}", exc_info=True
-        )
+        logger.error(f"Error loading model: {e}", exc_info=True)
+        _update_download_status("error", "", 0, str(e))
         dia_model = None
         model_config_instance = None
         MODEL_LOADED = False
         return False
+
+
+def _load_dia1_model(repo_id: str, cache_path: str):
+    """Loads a Dia 1 (original) model."""
+    global dia_model, model_config_instance, model_device, EXPECTED_SAMPLE_RATE
+
+    config_filename = get_model_config_filename()
+    weights_filename = get_model_weights_filename()
+    compute_dtype_str = get_compute_dtype(model_device, weights_filename)
+
+    logger.info(f"  Config file: {config_filename}")
+    logger.info(f"  Weights file: {weights_filename}")
+    logger.info(f"  Compute dtype: {compute_dtype_str}")
+
+    # Phase 1: Download config
+    _check_cancelled()
+    _update_download_status("downloading", f"Downloading config from {repo_id}...", 10)
+
+    local_config_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=config_filename,
+        cache_dir=cache_path,
+    )
+    logger.info(f"Configuration file path: {local_config_path}")
+
+    # Phase 2: Download weights
+    _check_cancelled()
+    _update_download_status("downloading", f"Downloading weights ({weights_filename})...", 30)
+
+    local_weights_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=weights_filename,
+        cache_dir=cache_path,
+    )
+    logger.info(f"Weights file path: {local_weights_path}")
+
+    # Phase 3: Load model
+    _check_cancelled()
+    _update_download_status("loading", "Loading Dia 1 model...", 60)
+
+    config = DiaConfig.load(local_config_path)
+    if config is None:
+        raise FileNotFoundError(f"Config file failed to load from {local_config_path}")
+
+    dia_instance = Dia1Model(config, compute_dtype=compute_dtype_str, device=model_device)
+
+    # Load weights
+    logger.info(f"Loading weights from: {local_weights_path}")
+    map_location = torch.device("cpu")
+    if local_weights_path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(local_weights_path, device=str(map_location))
+    elif local_weights_path.endswith(".pth"):
+        state_dict = torch.load(local_weights_path, map_location=map_location)
+    else:
+        raise ValueError(f"Unsupported weights file format: {weights_filename}")
+
+    _check_cancelled()
+    _update_download_status("loading", "Applying weights...", 75)
+
+    dia_instance.model.load_state_dict(state_dict)
+    dia_instance.model.to(model_device)
+    dia_instance.model.eval()
+
+    # Phase 4: Load DAC model
+    _check_cancelled()
+    _update_download_status("loading", "Loading DAC audio codec...", 85)
+
+    dia_instance._load_dac_model()
+
+    dia_model = dia_instance
+    model_config_instance = dia_model.config
+    EXPECTED_SAMPLE_RATE = DIA1_SAMPLE_RATE
+
+    _update_download_status("loading", "Dia 1 model ready.", 95)
+
+
+def _load_dia2_model(repo_id: str, cache_path: str):
+    """Loads a Dia 2 model using Dia2.from_repo()."""
+    global dia_model, model_config_instance, model_device, EXPECTED_SAMPLE_RATE
+
+    device_str = str(model_device) if model_device else "cuda"
+
+    # Determine dtype based on device
+    if model_device and model_device.type == "cuda":
+        dtype_str = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+    elif model_device and model_device.type == "mps":
+        dtype_str = "float16"
+    else:
+        dtype_str = "float32"
+
+    logger.info(f"  Dia 2 dtype: {dtype_str}")
+
+    # Phase 1: Download and load (Dia2.from_repo handles this)
+    _check_cancelled()
+    _update_download_status("downloading", f"Downloading {repo_id}...", 20)
+
+    # Dia2.from_repo downloads from HF and loads the model
+    _check_cancelled()
+    _update_download_status("loading", f"Loading Dia 2 model ({repo_id})...", 50)
+
+    dia2_instance = Dia2.from_repo(
+        repo_id,
+        device=device_str,
+        dtype=dtype_str,
+    )
+
+    _check_cancelled()
+    _update_download_status("loading", "Dia 2 model ready.", 95)
+
+    dia_model = dia2_instance
+    model_config_instance = None  # Dia 2 doesn't expose config the same way
+    EXPECTED_SAMPLE_RATE = dia2_instance.sample_rate
+
+    logger.info(f"Dia 2 sample rate: {EXPECTED_SAMPLE_RATE}")
+
+
+def unload_model() -> bool:
+    """
+    Unloads the current model and releases resources.
+    Does NOT reload - use reload_model_async() for hot-swap.
+    """
+    global dia_model, model_config_instance, MODEL_LOADED
+    global loaded_model_selector, loaded_model_type, model_device
+
+    logger.info("Initiating model unload sequence...")
+
+    if dia_model is not None:
+        # Try to close Dia2 model gracefully
+        if loaded_model_type == "dia2" and hasattr(dia_model, "close"):
+            try:
+                dia_model.close()
+            except Exception as e:
+                logger.warning(f"Error closing Dia2 model: {e}")
+
+        del dia_model
+        dia_model = None
+
+    if model_config_instance is not None:
+        del model_config_instance
+        model_config_instance = None
+
+    MODEL_LOADED = False
+    loaded_model_selector = None
+    loaded_model_type = None
+
+    # Force garbage collection and clear GPU cache
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info("CUDA cache cleared after model unload.")
+
+    logger.info("Model unloaded successfully.")
+    return True
+
+
+def _reload_model_worker():
+    """
+    Background worker that performs the actual model reload.
+    Runs in a separate thread so the FastAPI server stays responsive.
+    """
+    try:
+        _update_download_status("unloading", "Unloading current model...", 5)
+        unload_model()
+
+        _check_cancelled()
+        logger.info("Resources cleared. Loading model from updated config...")
+        load_model()
+    except RuntimeError as e:
+        if "cancelled" in str(e).lower():
+            logger.info(f"Reload worker cancelled: {e}")
+            _update_download_status("cancelled", "Model loading was cancelled.", 0)
+        else:
+            logger.error(f"Reload worker error: {e}", exc_info=True)
+            _update_download_status("error", "", 0, str(e))
+    except Exception as e:
+        logger.error(f"Reload worker error: {e}", exc_info=True)
+        _update_download_status("error", "", 0, str(e))
+
+
+def reload_model_async():
+    """
+    Initiates a model hot-swap in a background thread.
+    Returns immediately so the server can continue serving status polls.
+    If a load is already in progress, cancels it first.
+    """
+    global _load_thread
+
+    logger.info("Initiating async model hot-swap/reload sequence...")
+
+    # Cancel any in-progress load
+    if is_loading():
+        logger.info("Cancelling in-progress model load...")
+        _cancel_event.set()
+        _load_thread.join(timeout=15)
+        logger.info("Previous load thread finished.")
+
+    # Reset cancel flag for new load
+    _cancel_event.clear()
+
+    # Start new background load
+    _load_thread = threading.Thread(target=_reload_model_worker, daemon=True)
+    _load_thread.start()
+    logger.info("Background model reload thread started.")
+
+
+def cancel_loading():
+    """Cancels any in-progress model loading."""
+    if is_loading():
+        logger.info("Cancelling model loading by user request...")
+        _cancel_event.set()
+        _update_download_status("cancelling", "Cancelling model load...", 0)
+        return True
+    return False
+
+
+def reload_model() -> bool:
+    """
+    Synchronous reload (used for startup only).
+    Unloads current model, clears resources, reloads from config.
+    """
+    logger.info("Initiating synchronous model reload...")
+    _cancel_event.clear()
+    _update_download_status("unloading", "Unloading current model...", 5)
+    unload_model()
+    logger.info("Resources cleared. Loading model from updated config...")
+    return load_model()
 
 
 # --- Cloning Preparation Helper ---
@@ -634,10 +932,170 @@ def _find_reference_file(filename_input: str, base_path: str) -> Optional[str]:
     return None  # No match found
 
 
-# --- Speech Generation ---
+# --- Dia 2 Speech Generation ---
 
 
-# --- Simplified Speech Generation Function ---
+def _generate_speech_dia2(
+    text_to_process: str,
+    voice_mode: str = "single_s1",
+    clone_reference_filename: Optional[str] = None,
+    cfg_scale: float = 2.0,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    speed_factor: float = 1.0,
+    cfg_filter_top_k: int = 50,
+    seed: int = -1,
+    split_text: bool = False,
+    chunk_size: int = 120,
+    enable_silence_trimming: bool = True,
+    enable_internal_silence_fix: bool = True,
+) -> Optional[Tuple[np.ndarray, int]]:
+    """
+    Generates speech using a loaded Dia 2 model.
+    Uses GenerationConfig and prefix_speaker for voice conditioning.
+    """
+    global dia_model
+
+    if dia_model is None:
+        logger.error("Dia 2 model is not loaded.")
+        return None
+
+    monitor = PerformanceMonitor()
+    monitor.record("Request received in engine (Dia 2)")
+
+    # Seeding
+    if seed >= 0:
+        logger.info(f"Using generation seed: {seed}")
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    # Build GenerationConfig
+    gen_config = GenerationConfig(
+        cfg_scale=cfg_scale,
+        cfg_filter_k=cfg_filter_top_k,
+        audio=SamplingConfig(temperature=temperature, top_k=cfg_filter_top_k),
+    )
+
+    # Determine prefix speakers for cloning
+    prefix_s1 = None
+    prefix_s2 = None
+    if voice_mode == "clone" and clone_reference_filename:
+        # For Dia 2, we use prefix_speaker_1 with the reference audio path
+        prefix_s1 = clone_reference_filename
+        logger.info(f"Dia 2 cloning: using prefix_speaker_1={clone_reference_filename}")
+
+    # Text splitting
+    if split_text and len(text_to_process) >= chunk_size * 2:
+        text_chunks = chunk_text_by_sentences(text_to_process, chunk_size)
+        logger.info(f"Split text into {len(text_chunks)} chunks.")
+    else:
+        text_chunks = [text_to_process] if text_to_process.strip() else []
+
+    if not text_chunks:
+        logger.warning("No text chunks to process.")
+        return None
+
+    all_audio_arrays: List[np.ndarray] = []
+    total_chunks = len(text_chunks)
+    logger.info(f"Starting Dia 2 generation for {total_chunks} chunks.")
+
+    outer_pbar = None
+    if total_chunks > 1:
+        outer_pbar = tqdm(total=total_chunks, desc="Dia 2 Chunks", unit="chunk", position=0, leave=True)
+
+    try:
+        for i, chunk in enumerate(text_chunks):
+            chunk_start_time = time.time()
+            if outer_pbar:
+                outer_pbar.set_description(f"Chunk {i+1}/{total_chunks}")
+
+            logger.info(f"Processing chunk {i+1}/{total_chunks} with Dia 2 generate()...")
+
+            try:
+                result = dia_model.generate(
+                    chunk,
+                    config=gen_config,
+                    prefix_speaker_1=prefix_s1,
+                    prefix_speaker_2=prefix_s2,
+                    include_prefix=False,
+                    verbose=True,
+                )
+
+                # GenerationResult has .waveform (torch.Tensor) and .sample_rate
+                if result is not None and result.waveform is not None:
+                    waveform = result.waveform
+                    if isinstance(waveform, torch.Tensor):
+                        chunk_audio = waveform.cpu().numpy().squeeze()
+                    else:
+                        chunk_audio = np.array(waveform).squeeze()
+
+                    if chunk_audio.size > 0:
+                        all_audio_arrays.append(chunk_audio.astype(np.float32))
+                        chunk_duration = time.time() - chunk_start_time
+                        logger.info(f"Chunk {i+1} generated in {chunk_duration:.2f}s. Shape: {chunk_audio.shape}")
+                    else:
+                        logger.warning(f"Dia 2 generate() returned empty audio for chunk {i+1}.")
+                else:
+                    logger.warning(f"Dia 2 generate() returned None for chunk {i+1}.")
+
+            except Exception as gen_exc:
+                logger.error(f"Error in Dia 2 generate() for chunk {i+1}: {gen_exc}", exc_info=True)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if outer_pbar:
+                outer_pbar.update(1)
+
+        if outer_pbar:
+            outer_pbar.close()
+
+        if not all_audio_arrays:
+            logger.error("No audio generated from any chunk using Dia 2.")
+            return None
+
+        final_audio_np = np.concatenate(all_audio_arrays)
+        all_audio_arrays.clear()
+        logger.info(f"Concatenated Dia 2 audio shape: {final_audio_np.shape}")
+
+    except Exception as e:
+        if outer_pbar and not outer_pbar.disable:
+            outer_pbar.close()
+        logger.error(f"Error during Dia 2 generation loop: {e}", exc_info=True)
+        return None
+
+    # Apply speed factor
+    if speed_factor != 1.0:
+        logger.info(f"Applying speed factor: {speed_factor}")
+        original_len = len(final_audio_np)
+        speed_factor = max(0.5, min(speed_factor, 2.0))
+        target_len = int(original_len / speed_factor)
+        if target_len > 0 and target_len != original_len:
+            x_original = np.linspace(0, 1, original_len)
+            x_resampled = np.linspace(0, 1, target_len)
+            final_audio_np = np.interp(x_resampled, x_original, final_audio_np).astype(np.float32)
+
+    final_audio_np = final_audio_np.astype(np.float32)
+
+    # Post-processing
+    if enable_silence_trimming:
+        final_audio_np = trim_lead_trail_silence(final_audio_np, sample_rate=EXPECTED_SAMPLE_RATE)
+    if enable_internal_silence_fix:
+        final_audio_np = fix_internal_silence(final_audio_np, sample_rate=EXPECTED_SAMPLE_RATE)
+
+    logger.info(f"Dia 2 final audio shape: {final_audio_np.shape}")
+    logger.debug(monitor.report())
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return final_audio_np, EXPECTED_SAMPLE_RATE
+
+
+# --- Speech Generation (Unified Dispatch) ---
+
+
 def generate_speech(
     text_to_process: str,
     voice_mode: str = "single_s1",
@@ -660,31 +1118,42 @@ def generate_speech(
     enable_unvoiced_removal: bool = True,
 ) -> Optional[Tuple[np.ndarray, int]]:
     """
-    Generates speech using the loaded Dia model by calling model.generate() for each chunk.
-    This version explicitly ignores internal model state between chunks, potentially
-    affecting coherence for long inputs. It follows the author's sample calling pattern per chunk.
-
-    Args:
-        (Same as original generate_speech)
-
-    Returns:
-        Tuple of (numpy_audio_array, sample_rate), or None on failure.
+    Unified speech generation dispatcher.
+    Routes to the appropriate backend based on the loaded model type (Dia 1 or Dia 2).
     """
-    global dia_model  # Use the preloaded model instance
+    global dia_model
 
     if not MODEL_LOADED or dia_model is None or not model_device:
-        logger.error("Dia model is not loaded. Cannot generate speech.")
+        logger.error("No model loaded. Cannot generate speech.")
         return None
+
+    # --- Dispatch to Dia 2 backend ---
+    if loaded_model_type == "dia2":
+        return _generate_speech_dia2(
+            text_to_process=text_to_process,
+            voice_mode=voice_mode,
+            clone_reference_filename=clone_reference_filename,
+            cfg_scale=cfg_scale,
+            temperature=temperature,
+            top_p=top_p,
+            speed_factor=speed_factor,
+            cfg_filter_top_k=cfg_filter_top_k,
+            seed=seed,
+            split_text=split_text,
+            chunk_size=chunk_size,
+            enable_silence_trimming=enable_silence_trimming,
+            enable_internal_silence_fix=enable_internal_silence_fix,
+        )
+
+    # --- Dia 1 (original) backend below ---
 
     # Clear CUDA cache before starting new generation
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        import gc
-
         gc.collect()
 
     monitor = PerformanceMonitor()
-    monitor.record("Request received in engine (simple generate)")
+    monitor.record("Request received in engine (Dia 1 generate)")
 
     # Basic split_text logic (same as original)
     if split_text:

@@ -4,8 +4,14 @@ document.addEventListener('DOMContentLoaded', function () {
     let isGenerationCancelled = false;
     let wavesurfer = null;
     let saveStateTimeout = null; // For debouncing state saves
-    let hideChunkWarning = false; // Get initial warning flag state (will be updated in loadInitialState)    
-    let hideGenerationWarning = false; // Add this line for the new warning
+    let hideChunkWarning = false;
+    let hideGenerationWarning = false;
+
+    // --- Model Management State ---
+    let modelRegistry = {};
+    let currentModelInfo = {};
+    let modelChangesPending = false;
+    let selectedModelSelector = '';
 
     // --- Element Selectors ---
     const ttsForm = document.getElementById('tts-form');
@@ -48,6 +54,22 @@ document.addEventListener('DOMContentLoaded', function () {
     const generationWarningModal = document.getElementById('generation-warning-modal');
     const generationWarningAcknowledgeBtn = document.getElementById('generation-warning-acknowledge');
     const hideGenerationWarningCheckbox = document.getElementById('hide-generation-warning-checkbox');
+
+    // Model management DOM elements
+    const modelSelect = document.getElementById('model-select');
+    const modelStatusIndicator = document.getElementById('model-status-indicator');
+    const modelStatusText = document.getElementById('model-status-text');
+    const applyModelBtn = document.getElementById('apply-model-btn');
+    const modelActionRow = document.getElementById('model-action-row');
+    const modelPendingText = document.getElementById('model-pending-text');
+
+    // Model switch modal elements
+    const modelSwitchModal = document.getElementById('model-switch-modal');
+    const modelSwitchTitle = document.getElementById('model-switch-title');
+    const modelSwitchPhase = document.getElementById('model-switch-phase');
+    const modelSwitchDetail = document.getElementById('model-switch-detail');
+    const modelSwitchProgress = document.getElementById('model-switch-progress');
+    const modelSwitchPct = document.getElementById('model-switch-pct');
 
     // --- Configuration & State ---
     // Initial config loaded from server-rendered variable
@@ -380,6 +402,263 @@ document.addEventListener('DOMContentLoaded', function () {
         // Optionally display a message
         // presetsContainer.innerHTML = '<p class="text-sm text-slate-500 dark:text-slate-400">Could not load presets.</p>';
     }
+
+    // ========================================================================
+    // MODEL MANAGEMENT
+    // ========================================================================
+
+    function populateModelDropdown() {
+        if (!modelSelect) return;
+        modelSelect.innerHTML = '';
+        for (const [selector, info] of Object.entries(modelRegistry)) {
+            const option = document.createElement('option');
+            option.value = selector;
+            option.textContent = info.display_name + (info.available === false ? ' (not installed)' : '');
+            option.disabled = info.available === false;
+            modelSelect.appendChild(option);
+        }
+    }
+
+    function updateModelUI() {
+        if (!currentModelInfo || !currentModelInfo.selector) return;
+
+        // Update status indicator
+        if (currentModelInfo.loaded) {
+            if (modelStatusIndicator) modelStatusIndicator.className = 'status-dot-green';
+            if (modelStatusText) {
+                const shortDevice = (currentModelInfo.device || 'unknown').toUpperCase();
+                modelStatusText.textContent = `Loaded (${shortDevice})`;
+                modelStatusText.style.cssText = 'font-size:0.75rem; color:#22c55e; white-space:nowrap;';
+            }
+        } else {
+            if (modelStatusIndicator) modelStatusIndicator.className = 'status-dot-red';
+            if (modelStatusText) {
+                modelStatusText.textContent = 'Not loaded';
+                modelStatusText.style.cssText = 'font-size:0.75rem; color:#ef4444; white-space:nowrap;';
+            }
+        }
+
+        // Update dropdown to match loaded model
+        if (modelSelect && !modelChangesPending && currentModelInfo.selector) {
+            modelSelect.value = currentModelInfo.selector;
+            selectedModelSelector = currentModelInfo.selector;
+        }
+    }
+
+    function handleModelSelectChange() {
+        if (!modelSelect) return;
+
+        const newSelector = modelSelect.value;
+        const currentSelector = currentModelInfo?.selector || '';
+
+        if (newSelector !== currentSelector) {
+            modelChangesPending = true;
+
+            if (modelActionRow) {
+                modelActionRow.classList.remove('hidden');
+                modelActionRow.style.display = '';
+            }
+
+            if (modelStatusIndicator) modelStatusIndicator.className = 'status-dot-yellow';
+            if (modelStatusText) {
+                modelStatusText.textContent = 'Change pending';
+                modelStatusText.style.cssText = 'font-size:0.75rem; color:#ca8a04; white-space:nowrap;';
+            }
+        } else {
+            modelChangesPending = false;
+            if (modelActionRow) {
+                modelActionRow.classList.add('hidden');
+                modelActionRow.style.display = 'none';
+            }
+            updateModelUI();
+        }
+    }
+
+    function showModelSwitchModal() {
+        if (modelSwitchModal) {
+            modelSwitchModal.style.display = 'flex';
+            modelSwitchModal.classList.remove('hidden', 'opacity-0');
+            modelSwitchModal.dataset.state = 'open';
+        }
+    }
+
+    function hideModelSwitchModal() {
+        if (modelSwitchModal) {
+            modelSwitchModal.classList.add('opacity-0');
+            setTimeout(() => {
+                modelSwitchModal.style.display = 'none';
+                modelSwitchModal.dataset.state = 'closed';
+            }, 300);
+        }
+    }
+
+    function updateModelSwitchModalProgress(status) {
+        if (modelSwitchPhase) modelSwitchPhase.textContent = status.phase || 'Working...';
+        if (modelSwitchDetail) modelSwitchDetail.textContent = status.detail || '';
+        if (modelSwitchProgress) modelSwitchProgress.style.width = `${status.progress_pct || 0}%`;
+        if (modelSwitchPct) modelSwitchPct.textContent = `${status.progress_pct || 0}%`;
+    }
+
+    async function pollModelStatus() {
+        try {
+            const response = await fetch('/api/model-status');
+            if (!response.ok) return null;
+            return await response.json();
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function fetchModelInfo() {
+        try {
+            const response = await fetch('/api/model-info');
+            if (response.ok) {
+                currentModelInfo = await response.json();
+                updateModelUI();
+            }
+        } catch (e) {
+            console.warn('Failed to fetch model info:', e);
+        }
+    }
+
+    async function fetchModelRegistry() {
+        try {
+            const response = await fetch('/api/model-registry');
+            if (response.ok) {
+                modelRegistry = await response.json();
+                populateModelDropdown();
+            }
+        } catch (e) {
+            console.warn('Failed to fetch model registry:', e);
+        }
+    }
+
+    async function fetchInitialData() {
+        await fetchModelRegistry();
+        await fetchModelInfo();
+    }
+
+    async function applyModelChange() {
+        if (!modelSelect) return;
+
+        const newSelector = modelSelect.value;
+        const targetInfo = modelRegistry[newSelector];
+        if (!targetInfo) {
+            showNotification('Unknown model selected.', 'error');
+            return;
+        }
+
+        // Show modal immediately
+        if (modelSwitchTitle) modelSwitchTitle.textContent = `Switching to ${targetInfo.display_name}...`;
+        updateModelSwitchModalProgress({ phase: 'Saving configuration...', detail: 'Updating model selection.', progress_pct: 2 });
+        showModelSwitchModal();
+
+        if (applyModelBtn) applyModelBtn.disabled = true;
+
+        try {
+            // 1. Save the model selector to config
+            const saveResponse = await fetch('/save_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: { repo_id: newSelector } })
+            });
+
+            if (!saveResponse.ok) {
+                const errorResult = await saveResponse.json().catch(() => ({ detail: 'Failed to save' }));
+                throw new Error(errorResult.detail || 'Failed to save model configuration');
+            }
+
+            updateModelSwitchModalProgress({ phase: 'Configuration saved', detail: 'Initiating model download & load...', progress_pct: 5 });
+
+            // 2. Trigger async restart
+            const restartResponse = await fetch('/restart_server', { method: 'POST' });
+            if (!restartResponse.ok) {
+                const errData = await restartResponse.json().catch(() => ({ detail: 'Restart failed' }));
+                throw new Error(errData.detail || 'Failed to initiate model reload');
+            }
+
+            // 3. Poll for progress
+            let pollCount = 0;
+            const maxPolls = 1200; // 10 minutes max
+
+            const pollLoop = () => {
+                return new Promise((resolve, reject) => {
+                    const poll = async () => {
+                        try {
+                            const status = await pollModelStatus();
+                            if (status) {
+                                updateModelSwitchModalProgress(status);
+
+                                if (status.error) {
+                                    reject(new Error(status.error));
+                                    return;
+                                }
+
+                                if (status.phase === 'cancelled') {
+                                    reject(new Error('Model loading was cancelled.'));
+                                    return;
+                                }
+
+                                if (!status.active && status.phase === 'complete') {
+                                    resolve(true);
+                                    return;
+                                }
+                            }
+
+                            pollCount++;
+                            if (pollCount >= maxPolls) {
+                                reject(new Error('Model switch timed out after 10 minutes.'));
+                                return;
+                            }
+
+                            setTimeout(poll, 500);
+                        } catch (e) {
+                            reject(e);
+                        }
+                    };
+                    setTimeout(poll, 300);
+                });
+            };
+
+            await pollLoop();
+
+            // Success!
+            modelChangesPending = false;
+            hideModelSwitchModal();
+            showNotification(`Model switched to ${targetInfo.display_name} successfully!`, 'success', 5000);
+            await fetchInitialData();
+
+        } catch (error) {
+            console.error('Error applying model change:', error);
+            hideModelSwitchModal();
+
+            const isCancelled = error.message && error.message.toLowerCase().includes('cancel');
+            if (isCancelled) {
+                showNotification('Model switch cancelled.', 'info', 3000);
+            } else {
+                showNotification(`Model switch failed: ${error.message}`, 'error', 0);
+            }
+
+            try { await fetchInitialData(); } catch (e) { /* ignore */ }
+        } finally {
+            if (applyModelBtn) applyModelBtn.disabled = false;
+            if (!modelChangesPending && modelActionRow) {
+                modelActionRow.classList.add('hidden');
+                modelActionRow.style.display = 'none';
+            }
+        }
+    }
+
+    // Attach model management event listeners
+    if (modelSelect) {
+        modelSelect.addEventListener('change', handleModelSelectChange);
+    }
+    if (applyModelBtn) {
+        applyModelBtn.addEventListener('click', applyModelChange);
+    }
+
+    // Initialize model management
+    fetchInitialData();
 
     // --- Audio Player ---
     function initializeWaveSurfer(audioUrl, resultDetails = {}) {

@@ -71,6 +71,12 @@ from engine import (
     load_model as load_dia_model,
     generate_speech,
     EXPECTED_SAMPLE_RATE,
+    get_model_info,
+    get_model_registry,
+    get_download_status,
+    reload_model_async,
+    cancel_loading,
+    unload_model as engine_unload_model,
 )
 from utils import (
     encode_audio,
@@ -181,7 +187,7 @@ def _delayed_browser_open(host, port):
 app = FastAPI(
     title="Dia TTS Server",
     description="Text-to-Speech server using the Dia model, providing API and Web UI.",
-    version="1.4.0",  # Incremented version for config.yaml changes
+    version="2.0.0",  # Multi-model support: Dia 1.6B + Dia 2 (1B, 2B)
     lifespan=lifespan,
 )
 
@@ -334,6 +340,82 @@ async def get_predefined_voices_endpoint():
         )
 
 
+# --- Model Management Endpoints ---
+
+
+@app.get("/api/model-info", tags=["Model Management"])
+async def get_model_info_endpoint():
+    """Returns detailed information about the currently loaded TTS model."""
+    logger.debug("Request received for /api/model-info")
+    try:
+        return get_model_info()
+    except Exception as e:
+        logger.error(f"Error getting model info: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve model information")
+
+
+@app.get("/api/model-registry", tags=["Model Management"])
+async def get_model_registry_endpoint():
+    """Returns the full list of available models for the UI dropdown."""
+    return get_model_registry()
+
+
+@app.get("/api/model-status", tags=["Model Management"])
+async def get_model_status_endpoint():
+    """Returns the current download/loading progress for model switching."""
+    return get_download_status()
+
+
+@app.post("/restart_server", tags=["Model Management"])
+async def restart_server_endpoint():
+    """
+    Triggers an async hot-swap of the TTS model engine.
+    Returns immediately while the model downloads and loads in the background.
+    The UI polls /api/model-status to track progress.
+    """
+    logger.info("Request received for /restart_server (Async Model Hot-Swap).")
+    try:
+        reload_model_async()
+        return JSONResponse(content={
+            "message": "Model reload initiated in background. Poll /api/model-status for progress.",
+            "restart_needed": False,
+        })
+    except Exception as e:
+        logger.error(f"Error initiating model hot-swap: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to initiate model reload: {str(e)}",
+        )
+
+
+@app.post("/api/cancel-loading", tags=["Model Management"])
+async def cancel_loading_endpoint():
+    """Cancels any in-progress model loading."""
+    logger.info("Request received for /api/cancel-loading.")
+    cancelled = cancel_loading()
+    if cancelled:
+        return {"message": "Model loading cancellation requested."}
+    return {"message": "No model loading in progress."}
+
+
+@app.post("/api/unload", tags=["Model Management"])
+async def unload_model_endpoint():
+    """
+    Unloads the TTS model and releases all resources.
+    The model will need to be reloaded (via /restart_server) before TTS requests can be processed.
+    """
+    logger.info("Request received for /api/unload (Model Unload).")
+    try:
+        success = engine_unload_model()
+        if success:
+            return {"message": "Model unloaded successfully. Resources released."}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to unload model.")
+    except Exception as e:
+        logger.error(f"Error during model unload: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # --- API Endpoints (TTS Generation) ---
 
 
@@ -480,11 +562,11 @@ async def openai_tts_endpoint(request: OpenAITTSRequest):
 
         audio_array, sample_rate = result
 
-        if sample_rate != EXPECTED_SAMPLE_RATE:
+        if sample_rate != engine.EXPECTED_SAMPLE_RATE:
             logger.warning(
-                f"Engine returned sample rate {sample_rate}, expected {EXPECTED_SAMPLE_RATE}. Encoding will use {EXPECTED_SAMPLE_RATE}."
+                f"Engine returned sample rate {sample_rate}, expected {engine.EXPECTED_SAMPLE_RATE}. Encoding will use {engine.EXPECTED_SAMPLE_RATE}."
             )
-            sample_rate = EXPECTED_SAMPLE_RATE
+            sample_rate = engine.EXPECTED_SAMPLE_RATE
 
         encoded_audio = encode_audio(audio_array, sample_rate, request.response_format)
         monitor.record("Audio encoding complete")
@@ -633,11 +715,11 @@ async def custom_tts_endpoint(request: CustomTTSRequest):
 
         audio_array, sample_rate = result
 
-        if sample_rate != EXPECTED_SAMPLE_RATE:
+        if sample_rate != engine.EXPECTED_SAMPLE_RATE:
             logger.warning(
-                f"Engine returned sample rate {sample_rate}, expected {EXPECTED_SAMPLE_RATE}. Encoding will use {EXPECTED_SAMPLE_RATE}."
+                f"Engine returned sample rate {sample_rate}, expected {engine.EXPECTED_SAMPLE_RATE}. Encoding will use {engine.EXPECTED_SAMPLE_RATE}."
             )
-            sample_rate = EXPECTED_SAMPLE_RATE
+            sample_rate = engine.EXPECTED_SAMPLE_RATE
 
         encoded_audio = encode_audio(audio_array, sample_rate, request.output_format)
         monitor.record("Audio encoding complete")

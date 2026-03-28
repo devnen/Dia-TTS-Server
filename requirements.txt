@@ -23,6 +23,9 @@ requests # For health checks or other potential uses
 PyYAML # For parsing presets.yaml AND primary config.yaml
 tqdm
 
+# Dia 2 Model Support (optional - install for Dia 2 1B/2B models)
+# dia2  # Uncomment or install separately: pip install dia2
+
 # Audio Post-processing
 pydub
 praat-parselmouth # For unvoiced segment removal
